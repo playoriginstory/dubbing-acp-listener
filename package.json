@@ -9,5 +9,8 @@
   },
   "keywords": [],
   "author": "",
-  "license": "ISC"
+  "license": "ISC",
+  "dependencies": {
+    "@virtuals-protocol/acp-node": "^0.3.0-beta.30"
+  }
 }
