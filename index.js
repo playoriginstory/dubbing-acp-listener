@@ -1,5 +1,4 @@
-const { ACPClient } = require("@virtuals-protocol/acp-node");
-
+const ACPClient = require("@virtuals-protocol/acp-node").default;
 const client = new ACPClient({
   walletPrivateKey: process.env.WHITELISTED_WALLET_PRIVATE_KEY,
   agentWalletAddress: process.env.AGENT_WALLET_ADDRESS,
