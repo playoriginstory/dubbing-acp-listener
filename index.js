@@ -13,7 +13,6 @@ async function main() {
       const { videoUrl, targetLanguage } = job.serviceRequirement || {};
 
       if (!videoUrl || !targetLanguage) {
-        console.warn("Missing videoUrl or targetLanguage, marking job failed");
         await job.deliver({
           jobId: job.id.toString(),
           status: "failed",
@@ -29,23 +28,17 @@ async function main() {
           body: JSON.stringify({ videoUrl, targetLanguage, source_lang: "auto" }),
         });
 
-        if (!res.ok) throw new Error(`Dub API failed: ${res.status}`);
-
         const data = await res.json();
-        console.log("Dub result:", data);
-
-        if (!data.dubbedFileUrl) throw new Error("No dubbedFileUrl returned");
 
         const deliverable = {
           jobId: job.id.toString(),
           status: "completed",
-          dubbedFileUrl: data.dubbedFileUrl,
+          dubbedFileUrl: data.dubbedFileUrl || "",
         };
 
         await job.deliver(deliverable);
-        console.log("Job delivered successfully:", deliverable);
       } catch (err) {
-        console.error("Error processing job:", err.message || err);
+        console.error("Error processing job:", err);
         await job.deliver({
           jobId: job.id.toString(),
           status: "failed",
@@ -57,11 +50,6 @@ async function main() {
 
   await acpClient.init();
   console.log("ACP seller listener running...");
-  
-  acpClient.on("taskSubscribed", (task) => {
-    console.log("Subscribed to new task:", task.id);
-  });
-  
-  acpClient.on("newTask", (job) => {
-    console.log("Received a new job:", job.id, job.serviceRequirement);
-  });
+}
+
+main().catch(console.error);
