@@ -1,5 +1,5 @@
 import AcpClient, { AcpContractClient } from "@virtuals-protocol/acp-node";
-
+console.log("Private Key:", process.env.WHITELISTED_WALLET_PRIVATE_KEY?.slice(0, 6) + "..."); 
 // Map user-friendly language names to codes
 const LANGUAGES = [
   { code: "en", name: "English" }, { code: "hi", name: "Hindi" },
