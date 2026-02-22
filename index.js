@@ -95,10 +95,13 @@ async function main() {
         }
 
         await job.deliver({
-          jobId: job.id.toString(),
-          status: dubbedUrl ? "completed" : "failed",
-          dubbedFileUrl: dubbedUrl,
-        });
+            type: "object",
+            value: {
+              jobId: job.id.toString(),
+              status: dubbedUrl ? "completed" : "failed",
+              dubbedFileUrl: dubbedUrl,
+            },
+          });
 
         console.log("Job delivered:", dubbedUrl);
       } catch (err) {
