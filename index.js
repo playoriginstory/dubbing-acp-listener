@@ -1,28 +1,57 @@
-const AcpClient = require("@virtuals-protocol/acp-node").default;
-const { AcpContractClient } = require("@virtuals-protocol/acp-node");
+import AcpClient, { AcpContractClient, DeliverablePayload } from "@virtuals-protocol/acp-node";
 
 async function main() {
   const acpClient = new AcpClient({
     acpContractClient: await AcpContractClient.build(
-      process.env.WHITELISTED_WALLET_PRIVATE_KEY,
-      process.env.SELLER_ENTITY_ID,
-      process.env.SELLER_AGENT_WALLET_ADDRESS
+      process.env.WHITELISTED_WALLET_PRIVATE_KEY!,
+      process.env.SELLER_ENTITY_ID!,
+      process.env.SELLER_AGENT_WALLET_ADDRESS!
     ),
     onNewTask: async (job) => {
       console.log("New job received:", JSON.stringify(job));
 
-      const { videoUrl, target_lang } = job.serviceRequirement || {};
+      const { videoUrl, targetLanguage } = job.serviceRequirement || {};
 
-      const res = await fetch("https://duelsapp.vercel.app/api/dub", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ videoUrl, target_lang, source_lang: "auto" }),
-      });
+      if (!videoUrl || !targetLanguage) {
+        console.warn("Missing videoUrl or targetLanguage, marking job failed");
+        await job.deliver({
+          jobId: job.id.toString(),
+          status: "failed",
+          dubbedFileUrl: "",
+        });
+        return;
+      }
 
-      const data = await res.json();
-      console.log("Dub result:", data);
+      try {
+        const res = await fetch("https://duelsapp.vercel.app/api/dub", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ videoUrl, targetLanguage, source_lang: "auto" }),
+        });
 
-      await acpClient.deliverJob(job.id, `Dubbing started: ${data.dubbing_id}`);
+        if (!res.ok) throw new Error(`Dub API failed: ${res.status}`);
+
+        const data = await res.json();
+        console.log("Dub result:", data);
+
+        if (!data.dubbedFileUrl) throw new Error("No dubbedFileUrl returned");
+
+        const deliverable: DeliverablePayload = {
+          jobId: job.id.toString(),
+          status: "completed",
+          dubbedFileUrl: data.dubbedFileUrl,
+        };
+
+        await job.deliver(deliverable);
+        console.log("Job delivered successfully:", deliverable);
+      } catch (err: any) {
+        console.error("Error processing job:", err.message || err);
+        await job.deliver({
+          jobId: job.id.toString(),
+          status: "failed",
+          dubbedFileUrl: "",
+        });
+      }
     },
   });
 
