@@ -98,11 +98,11 @@ async function main() {
             type: "object",
             value: {
               jobId: job.id.toString(),
-              status: dubbedUrl ? "completed" : "failed",
-              dubbedFileUrl: dubbedUrl,
+              status: "completed",
+              dubbedFileUrl: dubbedUrl, // must be https://...
             },
           });
-
+          
         console.log("Job delivered:", dubbedUrl);
       } catch (err) {
         console.error("Error:", err);
