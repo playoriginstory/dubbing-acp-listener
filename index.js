@@ -40,15 +40,14 @@ const s3 = new S3Client({
 async function uploadToS3(buffer, key, contentType) {
   await s3.send(
     new PutObjectCommand({
-      Bucket: process.env.S3_BUCKET_NAME,
-      Key: key,
-      Body: buffer,
-      ContentType: contentType,
+    Bucket: process.env.AWS_S3_BUCKET,      
+    Key: key,
+    Body: buffer,
+    ContentType: contentType,
     })
   );
 
-  return `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
-}
+  return `https://${process.env.AWS_S3_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;}
 
 async function safeDeliver(job, status, dubbedFileUrl = "") {
   try {
