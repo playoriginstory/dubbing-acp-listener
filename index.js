@@ -46,8 +46,7 @@ async function main() {
         const requirement = job.serviceRequirement || {};
         console.log("Requirement:", JSON.stringify(requirement));
       
-        const { videoUrl, targetLanguage } = requirement;
-        const langCode = getLanguageCode(targetLanguage);
+        const { videoUrl, targetLanguage } = job.requirement || job.serviceRequirement || {};        const langCode = getLanguageCode(targetLanguage);
       
         console.log("videoUrl:", videoUrl);
         console.log("targetLanguage:", targetLanguage);
