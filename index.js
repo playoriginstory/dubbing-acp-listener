@@ -57,4 +57,11 @@ async function main() {
 
   await acpClient.init();
   console.log("ACP seller listener running...");
-}
+  
+  acpClient.on("taskSubscribed", (task) => {
+    console.log("Subscribed to new task:", task.id);
+  });
+  
+  acpClient.on("newTask", (job) => {
+    console.log("Received a new job:", job.id, job.serviceRequirement);
+  });
