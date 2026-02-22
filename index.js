@@ -40,15 +40,24 @@ async function main() {
 
   const acpClient = new AcpClient({
     acpContractClient,
- onNewTask: async (job) => {
-  console.log("New job received:", job.id);
+    onNewTask: async (job) => {
+        console.log("New job received:", job.id);
+      
+        const requirement = job.serviceRequirement || {};
+        console.log("Requirement:", JSON.stringify(requirement));
+      
+        const { videoUrl, targetLanguage } = requirement;
+        const langCode = getLanguageCode(targetLanguage);
+      
+        console.log("videoUrl:", videoUrl);
+        console.log("targetLanguage:", targetLanguage);
+        console.log("langCode:", langCode);
+      
+        if (!videoUrl || !langCode) {
+          console.log("Missing required fields, failing job");
+          await job.deliver({ jobId: job.id.toString(), status: "failed", dubbedFileUrl: "" });
+          return;
 
-  const { videoUrl, targetLanguage } = job.serviceRequirement || {};
-  const langCode = getLanguageCode(targetLanguage);
-
-  if (!videoUrl || !langCode) {
-    await job.deliver({ jobId: job.id.toString(), status: "failed", dubbedFileUrl: "" });
-    return;
   }
 
   try {
