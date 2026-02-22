@@ -1,6 +1,6 @@
 
 import pkg from "@virtuals-protocol/acp-node";
-const { createAcpClient, AcpContractClient } = pkg;
+const { AcpClient, AcpContractClient } = pkg;
 
 console.log("All env keys:", Object.keys(process.env).filter(k => k.includes('WALLET')));
 console.log("Private Key:", process.env.WHITELISTED_WALLET_PRIVATE_KEY?.slice(0, 6) + "...");
