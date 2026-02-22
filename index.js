@@ -58,5 +58,3 @@ async function main() {
   await acpClient.init();
   console.log("ACP seller listener running...");
 }
-
-main().catch(console.error);
