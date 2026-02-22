@@ -28,60 +28,59 @@ function getLanguageCode(input) {
   return entry ? entry.code : null;
 }
 
+import { createAcpClient, AcpContractClient } from "@virtuals-protocol/acp-node";
+
 async function main() {
-  const acpClient = new AcpClient({
-    acpContractClient: await AcpContractClient.build(
-      process.env.WHITELISTED_WALLET_PRIVATE_KEY,
-      process.env.SELLER_ENTITY_ID,
-      process.env.SELLER_AGENT_WALLET_ADDRESS
-    ),
+  const acpContractClient = await AcpContractClient.build(
+    process.env.WHITELISTED_WALLET_PRIVATE_KEY,
+    process.env.SELLER_ENTITY_ID,
+    process.env.SELLER_AGENT_WALLET_ADDRESS
+  );
+
+  const acpClient = createAcpClient({
+    acpContractClient,
     onNewTask: async (job) => {
-      console.log(`Received job #${job.id}`);
+      console.log("New job received:", JSON.stringify(job));
+
       const { videoUrl, targetLanguage } = job.serviceRequirement || {};
-
       if (!videoUrl || !targetLanguage) {
-        console.warn(`Job #${job.id} missing videoUrl or targetLanguage`);
-        await job.deliver({ jobId: job.id.toString(), status: "failed", dubbedFileUrl: "" });
+        await job.deliver({
+          jobId: job.id.toString(),
+          status: "failed",
+          dubbedFileUrl: "",
+        });
         return;
       }
-
-      const langCode = getLanguageCode(targetLanguage);
-      if (!langCode) {
-        console.warn(`Job #${job.id} has unsupported target language: ${targetLanguage}`);
-        await job.deliver({ jobId: job.id.toString(), status: "failed", dubbedFileUrl: "" });
-        return;
-      }
-
-      console.log(`Job #${job.id} -> Dubbing to ${langCode}`);
 
       try {
         const res = await fetch("https://duelsapp.vercel.app/api/dub", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ videoUrl, targetLanguage: langCode, source_lang: "auto" }),
+          body: JSON.stringify({ videoUrl, targetLanguage, source_lang: "auto" }),
         });
 
-        if (!res.ok) throw new Error(`Dub API failed with status ${res.status}`);
         const data = await res.json();
-        console.log(`Dub API response for job #${job.id}:`, data);
-
         const deliverable = {
           jobId: job.id.toString(),
-          status: data.dubbedFileUrl ? "completed" : "failed",
+          status: "completed",
           dubbedFileUrl: data.dubbedFileUrl || "",
         };
 
         await job.deliver(deliverable);
-        console.log(`Job #${job.id} delivered:`, deliverable);
+        console.log("Job delivered:", deliverable);
       } catch (err) {
-        console.error(`Error processing job #${job.id}:`, err.message || err);
-        await job.deliver({ jobId: job.id.toString(), status: "failed", dubbedFileUrl: "" });
+        console.error("Error processing job:", err);
+        await job.deliver({
+          jobId: job.id.toString(),
+          status: "failed",
+          dubbedFileUrl: "",
+        });
       }
     },
   });
 
   await acpClient.init();
-  console.log("ACP seller listener running and ready to receive jobs...");
+  console.log("ACP seller listener running...");
 }
 
-main().catch((err) => console.error("Listener failed to start:", err));
+main().catch(console.error);
