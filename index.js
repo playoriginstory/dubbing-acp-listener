@@ -1,11 +1,11 @@
-import AcpClient, { AcpContractClient, DeliverablePayload } from "@virtuals-protocol/acp-node";
+import AcpClient, { AcpContractClient } from "@virtuals-protocol/acp-node";
 
 async function main() {
   const acpClient = new AcpClient({
     acpContractClient: await AcpContractClient.build(
-      process.env.WHITELISTED_WALLET_PRIVATE_KEY!,
-      process.env.SELLER_ENTITY_ID!,
-      process.env.SELLER_AGENT_WALLET_ADDRESS!
+      process.env.WHITELISTED_WALLET_PRIVATE_KEY,
+      process.env.SELLER_ENTITY_ID,
+      process.env.SELLER_AGENT_WALLET_ADDRESS
     ),
     onNewTask: async (job) => {
       console.log("New job received:", JSON.stringify(job));
@@ -36,7 +36,7 @@ async function main() {
 
         if (!data.dubbedFileUrl) throw new Error("No dubbedFileUrl returned");
 
-        const deliverable: DeliverablePayload = {
+        const deliverable = {
           jobId: job.id.toString(),
           status: "completed",
           dubbedFileUrl: data.dubbedFileUrl,
@@ -44,7 +44,7 @@ async function main() {
 
         await job.deliver(deliverable);
         console.log("Job delivered successfully:", deliverable);
-      } catch (err: any) {
+      } catch (err) {
         console.error("Error processing job:", err.message || err);
         await job.deliver({
           jobId: job.id.toString(),
