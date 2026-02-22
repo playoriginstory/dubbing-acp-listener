@@ -1,5 +1,5 @@
 import pkg from "@virtuals-protocol/acp-node";
-const { default: AcpClient, AcpContractClient } = pkg;
+const { default: AcpClient, AcpContractClientV2 } = pkg;
 
 console.log("All env keys:", Object.keys(process.env).filter(k => k.includes('WALLET')));
 console.log("Private Key:", process.env.WHITELISTED_WALLET_PRIVATE_KEY?.slice(0, 6) + "...");
@@ -32,12 +32,12 @@ function getLanguageCode(input) {
 }
 
 async function main() {
-  const acpContractClient = await AcpContractClient.build(
-    process.env.WHITELISTED_WALLET_PRIVATE_KEY,
-    process.env.SELLER_ENTITY_ID,
-    process.env.SELLER_AGENT_WALLET_ADDRESS
-  );
-
+    const acpContractClient = await AcpContractClientV2.build(
+        process.env.WHITELISTED_WALLET_PRIVATE_KEY,
+        parseInt(process.env.SELLER_ENTITY_ID),
+        process.env.SELLER_AGENT_WALLET_ADDRESS
+      );
+      
   const acpClient = new AcpClient({
     acpContractClient,
     onNewTask: async (job) => {
