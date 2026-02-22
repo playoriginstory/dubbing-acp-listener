@@ -1,7 +1,9 @@
 import pkg from "@virtuals-protocol/acp-node";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+
 const { default: AcpClient, AcpContractClientV2 } = pkg;
 
-console.log("All env keys:", Object.keys(process.env).filter(k => k.includes('WALLET')));
+console.log("All env keys:", Object.keys(process.env).filter(k => k.includes("WALLET")));
 console.log("Private Key:", process.env.WHITELISTED_WALLET_PRIVATE_KEY?.slice(0, 6) + "...");
 
 const LANGUAGES = [
@@ -33,6 +35,23 @@ function getLanguageCode(input) {
 
 const processedJobs = new Set();
 
+// Initialize S3 client
+const s3 = new S3Client({ region: process.env.AWS_REGION });
+
+// Helper to upload buffer to S3
+async function uploadToS3(buffer, key, contentType) {
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: process.env.S3_BUCKET_NAME,
+      Key: key,
+      Body: buffer,
+      ContentType: contentType,
+      ACL: "public-read",
+    })
+  );
+  return `https://${process.env.S3_BUCKET_NAME}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
+}
+
 async function main() {
   const acpContractClient = await AcpContractClientV2.build(
     process.env.WHITELISTED_WALLET_PRIVATE_KEY,
@@ -54,10 +73,6 @@ async function main() {
       const { videoUrl, targetLanguage } = job.requirement || job.serviceRequirement || {};
       const langCode = getLanguageCode(targetLanguage);
 
-      console.log("videoUrl:", videoUrl);
-      console.log("targetLanguage:", targetLanguage);
-      console.log("langCode:", langCode);
-
       if (!videoUrl || !langCode) {
         console.log("Missing required fields, failing job");
         await job.deliver({ jobId: job.id.toString(), status: "failed", dubbedFileUrl: "" });
@@ -65,6 +80,7 @@ async function main() {
       }
 
       try {
+        // Start dubbing
         const dubRes = await fetch("https://duelsapp.vercel.app/api/dub", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -73,14 +89,15 @@ async function main() {
         const dubData = await dubRes.json();
         const dubbingId = dubData.dubbing_id;
 
-        console.log("Dubbing started:", dubbingId);
-
         if (!dubbingId) {
           await job.deliver({ jobId: job.id.toString(), status: "failed", dubbedFileUrl: "" });
           return;
         }
 
+        console.log("Dubbing started:", dubbingId);
+
         let dubbedUrl = "";
+        // Poll for completion
         for (let i = 0; i < 24; i++) {
           await new Promise(r => setTimeout(r, 10000));
           const statusRes = await fetch(`https://duelsapp.vercel.app/api/dub-status?id=${dubbingId}`);
@@ -88,21 +105,33 @@ async function main() {
           console.log(`Poll ${i + 1}: status = ${statusData.status}`);
 
           if (statusData.status === "dubbed") {
-            dubbedUrl = `https://duelsapp.vercel.app/api/fetch-dub?dubbing_id=${dubbingId}&target_lang=${langCode}`;
+            // Fetch dubbed file from ElevenLabs
+            const elevenRes = await fetch(
+              `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/audio/${langCode}`,
+              { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY } }
+            );
+            if (!elevenRes.ok) throw new Error("Failed to fetch dubbed file");
+
+            const arrayBuffer = await elevenRes.arrayBuffer();
+            const buffer = Buffer.from(arrayBuffer);
+            const contentType = elevenRes.headers.get("content-type") || "audio/mpeg";
+
+            // Upload to S3
+            dubbedUrl = await uploadToS3(buffer, `${dubbingId}_${langCode}.mp4`, contentType);
             break;
           }
           if (statusData.status === "failed") break;
         }
 
         await job.deliver({
-            type: "object",
-            value: {
-              jobId: job.id.toString(),
-              status: "completed",
-              dubbedFileUrl: dubbedUrl, // must be https://...
-            },
-          });
-          
+          type: "object",
+          value: {
+            jobId: job.id.toString(),
+            status: dubbedUrl ? "completed" : "failed",
+            dubbedFileUrl: dubbedUrl,
+          },
+        });
+
         console.log("Job delivered:", dubbedUrl);
       } catch (err) {
         console.error("Error:", err);
