@@ -25,82 +25,87 @@ const LANGUAGES = [
 function getLanguageCode(input) {
   if (!input) return null;
   const entry = LANGUAGES.find(
-    l => l.code.toLowerCase() === input.toLowerCase() || 
+    l => l.code.toLowerCase() === input.toLowerCase() ||
          l.name.toLowerCase() === input.toLowerCase()
   );
   return entry ? entry.code : null;
 }
 
+const processedJobs = new Set();
+
 async function main() {
-    const acpContractClient = await AcpContractClientV2.build(
-        process.env.WHITELISTED_WALLET_PRIVATE_KEY,
-        parseInt(process.env.SELLER_ENTITY_ID),
-        process.env.SELLER_AGENT_WALLET_ADDRESS
-      );
+  const acpContractClient = await AcpContractClientV2.build(
+    process.env.WHITELISTED_WALLET_PRIVATE_KEY,
+    parseInt(process.env.SELLER_ENTITY_ID),
+    process.env.SELLER_AGENT_WALLET_ADDRESS
+  );
 
   const acpClient = new AcpClient({
     acpContractClient,
     onNewTask: async (job) => {
-        console.log("New job received:", job.id);
-      
-        const requirement = job.serviceRequirement || {};
-        console.log("Requirement:", JSON.stringify(requirement));
-      
-        const { videoUrl, targetLanguage } = job.requirement || job.serviceRequirement || {};        const langCode = getLanguageCode(targetLanguage);
-      
-        console.log("videoUrl:", videoUrl);
-        console.log("targetLanguage:", targetLanguage);
-        console.log("langCode:", langCode);
-      
-        if (!videoUrl || !langCode) {
-          console.log("Missing required fields, failing job");
+      if (processedJobs.has(job.id)) {
+        console.log(`Job ${job.id} already being processed, skipping`);
+        return;
+      }
+      processedJobs.add(job.id);
+
+      console.log("New job received:", job.id);
+
+      const { videoUrl, targetLanguage } = job.requirement || job.serviceRequirement || {};
+      const langCode = getLanguageCode(targetLanguage);
+
+      console.log("videoUrl:", videoUrl);
+      console.log("targetLanguage:", targetLanguage);
+      console.log("langCode:", langCode);
+
+      if (!videoUrl || !langCode) {
+        console.log("Missing required fields, failing job");
+        await job.deliver({ jobId: job.id.toString(), status: "failed", dubbedFileUrl: "" });
+        return;
+      }
+
+      try {
+        const dubRes = await fetch("https://duelsapp.vercel.app/api/dub", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ videoUrl, target_lang: langCode, source_lang: "auto" }),
+        });
+        const dubData = await dubRes.json();
+        const dubbingId = dubData.dubbing_id;
+
+        console.log("Dubbing started:", dubbingId);
+
+        if (!dubbingId) {
           await job.deliver({ jobId: job.id.toString(), status: "failed", dubbedFileUrl: "" });
           return;
+        }
 
-  }
+        let dubbedUrl = "";
+        for (let i = 0; i < 24; i++) {
+          await new Promise(r => setTimeout(r, 10000));
+          const statusRes = await fetch(`https://duelsapp.vercel.app/api/dub-status?id=${dubbingId}`);
+          const statusData = await statusRes.json();
+          console.log(`Poll ${i + 1}: status = ${statusData.status}`);
 
-  try {
-    // Start dubbing
-    const dubRes = await fetch("https://duelsapp.vercel.app/api/dub", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ videoUrl, target_lang: langCode, source_lang: "auto" }),
-    });
-    const dubData = await dubRes.json();
-    const dubbingId = dubData.dubbing_id;
+          if (statusData.status === "dubbed") {
+            dubbedUrl = `https://duelsapp.vercel.app/api/fetch-dub?dubbing_id=${dubbingId}&target_lang=${langCode}`;
+            break;
+          }
+          if (statusData.status === "failed") break;
+        }
 
-    if (!dubbingId) {
-      await job.deliver({ jobId: job.id.toString(), status: "failed", dubbedFileUrl: "" });
-      return;
-    }
+        await job.deliver({
+          jobId: job.id.toString(),
+          status: dubbedUrl ? "completed" : "failed",
+          dubbedFileUrl: dubbedUrl,
+        });
 
-    // Poll for completion
-    let dubbedUrl = "";
-    for (let i = 0; i < 24; i++) {
-      await new Promise(r => setTimeout(r, 10000)); // wait 10 seconds
-      const statusRes = await fetch(`https://duelsapp.vercel.app/api/dub-status?id=${dubbingId}`);
-      const statusData = await statusRes.json();
-      console.log(`Poll ${i + 1}: status = ${statusData.status}`);
-
-      if (statusData.status === "dubbed") {
-        dubbedUrl = `https://duelsapp.vercel.app/api/fetch-dub?dubbing_id=${dubbingId}&target_lang=${langCode}`;
-        break;
+        console.log("Job delivered:", dubbedUrl);
+      } catch (err) {
+        console.error("Error:", err);
+        await job.deliver({ jobId: job.id.toString(), status: "failed", dubbedFileUrl: "" });
       }
-      if (statusData.status === "failed") break;
-    }
-
-    await job.deliver({
-      jobId: job.id.toString(),
-      status: dubbedUrl ? "completed" : "failed",
-      dubbedFileUrl: dubbedUrl,
-    });
-
-    console.log("Job delivered:", dubbedUrl);
-  } catch (err) {
-    console.error("Error:", err);
-    await job.deliver({ jobId: job.id.toString(), status: "failed", dubbedFileUrl: "" });
-  }
-},
+    },
   });
 
   await acpClient.init();
