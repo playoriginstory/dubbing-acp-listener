@@ -1,4 +1,5 @@
 import AcpClient, { AcpContractClient } from "@virtuals-protocol/acp-node";
+console.log("All env keys:", Object.keys(process.env).filter(k => k.includes('WALLET')));
 console.log("Private Key:", process.env.WHITELISTED_WALLET_PRIVATE_KEY?.slice(0, 6) + "..."); 
 // Map user-friendly language names to codes
 const LANGUAGES = [
