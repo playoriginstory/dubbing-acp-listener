@@ -28,7 +28,6 @@ function getLanguageCode(input) {
   return entry ? entry.code : null;
 }
 
-import { createAcpClient, AcpContractClient } from "@virtuals-protocol/acp-node";
 
 async function main() {
   const acpContractClient = await AcpContractClient.build(
