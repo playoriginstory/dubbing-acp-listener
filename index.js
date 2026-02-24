@@ -263,6 +263,90 @@ async function processVoiceover(job) {
   }
 }
 
+async function processPremiumMusic(job) {
+  const {
+    concept,
+    genre,
+    mood,
+    vocalStyle,
+    duration
+  } = job.requirement || job.serviceRequirement || {};
+
+  if (!concept || !genre || !mood || !vocalStyle || !duration) {
+    await job.deliver({
+      type: "object",
+      value: {
+        jobId: job.id.toString(),
+        status: "failed",
+        audio: ""
+      }
+    });
+    return;
+  }
+
+  try {
+    const finalPrompt = `
+Create a professionally produced ${genre} track.
+Theme: ${concept}.
+Mood: ${mood}.
+Vocals: ${vocalStyle}.
+High quality production, radio-ready mix, cinematic depth, modern sound design.
+`;
+
+    const response = await fetch(
+      "https://api.elevenlabs.io/v1/music?output_format=mp3_44100_128",
+      {
+        method: "POST",
+        headers: {
+          "xi-api-key": process.env.ELEVENLABS_API_KEY,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          prompt: finalPrompt,
+          music_length_ms: parseInt(duration) * 1000,
+          model_id: "music_v1",
+          force_instrumental:
+            vocalStyle.toLowerCase() === "instrumental"
+        })
+      }
+    );
+
+    if (!response.ok) {
+      throw new Error("Music generation failed");
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    const key = `music/${job.id}.mp3`;
+    const url = await uploadToS3(buffer, key, "audio/mpeg");
+
+    await job.deliver({
+      type: "object",
+      value: {
+        jobId: job.id.toString(),
+        status: "completed",
+        audio: url
+      }
+    });
+
+    console.log("Premium music delivered:", url);
+
+  } catch (err) {
+    console.error("Premium music error:", err);
+
+    await job.deliver({
+      type: "object",
+      value: {
+        jobId: job.id.toString(),
+        status: "failed",
+        audio: ""
+      }
+    });
+  }
+}
+
+
 /* -------------------------
    ACP MAIN
 -------------------------- */
@@ -291,10 +375,18 @@ async function main() {
 
         if (job.name === "dubcontent") {
           await processDubbing(job);
+          return;
+        }
+
+        if (job.name === "premiummusic") {
+          await processPremiumMusic(job);
+          return;
         }
 
         if (job.name === "voiceover") {
           await processVoiceover(job);
+          return;
+
         }
       }
     },
