@@ -3,22 +3,40 @@ import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 
 const { default: AcpClient, AcpContractClientV2 } = pkg;
 
+/* -------------------------
+   LANGUAGE LIST (DUBBING)
+-------------------------- */
+
 const LANGUAGES = [
-  { code: "en", name: "English" }, { code: "es", name: "Spanish" },
-  { code: "fr", name: "French" }, { code: "de", name: "German" },
-  { code: "ja", name: "Japanese" }, { code: "zh", name: "Chinese" },
-  { code: "pt", name: "Portuguese" }, { code: "hi", name: "Hindi" },
-  { code: "ar", name: "Arabic" }, { code: "ru", name: "Russian" },
-  { code: "ko", name: "Korean" }, { code: "it", name: "Italian" },
-  { code: "nl", name: "Dutch" }, { code: "tr", name: "Turkish" },
-  { code: "pl", name: "Polish" }, { code: "sv", name: "Swedish" },
-  { code: "fil", name: "Filipino" }, { code: "ms", name: "Malay" },
-  { code: "ro", name: "Romanian" }, { code: "uk", name: "Ukrainian" },
-  { code: "el", name: "Greek" }, { code: "cs", name: "Czech" },
-  { code: "da", name: "Danish" }, { code: "fi", name: "Finnish" },
-  { code: "bg", name: "Bulgarian" }, { code: "hr", name: "Croatian" },
-  { code: "sk", name: "Slovak" }, { code: "ta", name: "Tamil" },
-  { code: "id", name: "Indonesian" },
+  { code: "en", name: "English" },
+  { code: "es", name: "Spanish" },
+  { code: "fr", name: "French" },
+  { code: "de", name: "German" },
+  { code: "ja", name: "Japanese" },
+  { code: "zh", name: "Chinese" },
+  { code: "pt", name: "Portuguese" },
+  { code: "hi", name: "Hindi" },
+  { code: "ar", name: "Arabic" },
+  { code: "ru", name: "Russian" },
+  { code: "ko", name: "Korean" },
+  { code: "it", name: "Italian" },
+  { code: "nl", name: "Dutch" },
+  { code: "tr", name: "Turkish" },
+  { code: "pl", name: "Polish" },
+  { code: "sv", name: "Swedish" },
+  { code: "fil", name: "Filipino" },
+  { code: "ms", name: "Malay" },
+  { code: "ro", name: "Romanian" },
+  { code: "uk", name: "Ukrainian" },
+  { code: "el", name: "Greek" },
+  { code: "cs", name: "Czech" },
+  { code: "da", name: "Danish" },
+  { code: "fi", name: "Finnish" },
+  { code: "bg", name: "Bulgarian" },
+  { code: "hr", name: "Croatian" },
+  { code: "sk", name: "Slovak" },
+  { code: "ta", name: "Tamil" },
+  { code: "id", name: "Indonesian" }
 ];
 
 function getLanguageCode(input) {
@@ -31,10 +49,33 @@ function getLanguageCode(input) {
   return entry ? entry.code : null;
 }
 
+/* -------------------------
+   VOICE STYLE → VOICE ID MAP
+-------------------------- */
+
+const VOICE_MAP = {
+  charles: "S9GPGBaMND8XWwwzxQXp",
+  jessica: "cgSgspJ2msm6clMCkdW9",
+  darryl: "h8LZpYr8y3VBz0q2x0LP",
+  lily: "pFZP5JQG7iQjIQuC4Bku",
+  donald: "X4tS1zPSNPkD36l35rq7",
+  matilda: "XrExE9yKIg1WjnnlVkGX",
+  alice: "Xb7hH8MSUJpSbSDYk0k2"
+};
+
+function getVoiceId(style) {
+  if (!style) return VOICE_MAP.charles;
+  return VOICE_MAP[style.toLowerCase()] || VOICE_MAP.charles;
+}
+
 const processedJobs = new Set();
 
+/* -------------------------
+   S3 SETUP
+-------------------------- */
+
 const s3 = new S3Client({
-  region: process.env.AWS_REGION,
+  region: process.env.AWS_REGION
 });
 
 async function uploadToS3(buffer, key, contentType) {
@@ -43,27 +84,16 @@ async function uploadToS3(buffer, key, contentType) {
       Bucket: process.env.AWS_S3_BUCKET,
       Key: key,
       Body: buffer,
-      ContentType: contentType,
+      ContentType: contentType
     })
   );
 
   return `https://${process.env.AWS_S3_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
 }
 
-async function safeDeliver(job, status, dubbedFileUrl = "") {
-  try {
-    await job.deliver({
-      type: "object",
-      value: {
-        jobId: job.id.toString(),
-        status,
-        dubbedFileUrl,
-      },
-    });
-  } catch (err) {
-    console.error("Delivery error:", err);
-  }
-}
+/* -------------------------
+   DUBBING LOGIC
+-------------------------- */
 
 async function processDubbing(job) {
   const { videoUrl, targetLanguage } =
@@ -72,7 +102,14 @@ async function processDubbing(job) {
   const langCode = getLanguageCode(targetLanguage);
 
   if (!videoUrl || !langCode) {
-    await safeDeliver(job, "failed");
+    await job.deliver({
+      type: "object",
+      value: {
+        jobId: job.id.toString(),
+        status: "failed",
+        dubbedFileUrl: ""
+      }
+    });
     return;
   }
 
@@ -83,19 +120,14 @@ async function processDubbing(job) {
       body: JSON.stringify({
         videoUrl,
         target_lang: langCode,
-        source_lang: "auto",
-      }),
+        source_lang: "auto"
+      })
     });
 
     const dubData = await dubRes.json();
     const dubbingId = dubData.dubbing_id;
 
-    if (!dubbingId) {
-      await safeDeliver(job, "failed");
-      return;
-    }
-
-    console.log("Dubbing started:", dubbingId);
+    if (!dubbingId) throw new Error("No dubbing ID returned");
 
     let dubbedUrl = "";
 
@@ -105,33 +137,28 @@ async function processDubbing(job) {
       const statusRes = await fetch(
         `https://duelsapp.vercel.app/api/dub-status?id=${dubbingId}`
       );
-      const statusData = await statusRes.json();
 
-      console.log(`Poll ${i + 1}:`, statusData.status);
+      const statusData = await statusRes.json();
 
       if (statusData.status === "dubbed") {
         const elevenRes = await fetch(
           `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/audio/${langCode}`,
           {
             headers: {
-              "xi-api-key": process.env.ELEVENLABS_API_KEY,
-            },
+              "xi-api-key": process.env.ELEVENLABS_API_KEY
+            }
           }
         );
 
         if (!elevenRes.ok) throw new Error("Failed to fetch dubbed file");
 
-        const arrayBuffer = await elevenRes.arrayBuffer();
-        const buffer = Buffer.from(arrayBuffer);
-
+        const buffer = Buffer.from(await elevenRes.arrayBuffer());
         const contentType =
           elevenRes.headers.get("content-type") || "audio/mpeg";
 
-        const extension = contentType.includes("wav") ? "wav" : "mp3";
-
         dubbedUrl = await uploadToS3(
           buffer,
-          `dubbed/${dubbingId}_${langCode}.${extension}`,
+          `dubbed/${dubbingId}_${langCode}.mp3`,
           contentType
         );
 
@@ -141,19 +168,104 @@ async function processDubbing(job) {
       if (statusData.status === "failed") break;
     }
 
-    if (!dubbedUrl) {
-      await safeDeliver(job, "failed");
-      return;
-    }
+    if (!dubbedUrl) throw new Error("Dubbing failed");
 
-    await safeDeliver(job, "completed", dubbedUrl);
-    console.log("Delivered:", dubbedUrl);
+    await job.deliver({
+      type: "object",
+      value: {
+        jobId: job.id.toString(),
+        status: "completed",
+        dubbedFileUrl: dubbedUrl
+      }
+    });
 
   } catch (err) {
-    console.error("Processing error:", err);
-    await safeDeliver(job, "failed");
+    console.error("Dubbing error:", err);
+
+    await job.deliver({
+      type: "object",
+      value: {
+        jobId: job.id.toString(),
+        status: "failed",
+        dubbedFileUrl: ""
+      }
+    });
   }
 }
+
+/* -------------------------
+   VOICEOVER LOGIC (UPDATED)
+-------------------------- */
+
+async function processVoiceover(job) {
+  const { text, voiceStyle } =
+    job.requirement || job.serviceRequirement || {};
+
+  const voiceId = getVoiceId(voiceStyle);
+
+  if (!text) {
+    await job.deliver({
+      type: "object",
+      value: {
+        jobId: job.id.toString(),
+        status: "failed",
+        audio: ""
+      }
+    });
+    return;
+  }
+
+  try {
+    const response = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
+      {
+        method: "POST",
+        headers: {
+          "xi-api-key": process.env.ELEVENLABS_API_KEY,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          text,
+          model_id: "eleven_multilingual_v2"
+        })
+      }
+    );
+
+    if (!response.ok) throw new Error("Voiceover generation failed");
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const key = `voiceover/${job.id}.mp3`;
+
+    const url = await uploadToS3(buffer, key, "audio/mpeg");
+
+    await job.deliver({
+      type: "object",
+      value: {
+        jobId: job.id.toString(),
+        status: "completed",
+        audio: url
+      }
+    });
+
+    console.log("Voiceover delivered:", url);
+
+  } catch (err) {
+    console.error("Voiceover error:", err);
+
+    await job.deliver({
+      type: "object",
+      value: {
+        jobId: job.id.toString(),
+        status: "failed",
+        audio: ""
+      }
+    });
+  }
+}
+
+/* -------------------------
+   ACP MAIN
+-------------------------- */
 
 async function main() {
   const acpContractClient = await AcpContractClientV2.build(
@@ -166,46 +278,40 @@ async function main() {
     acpContractClient,
 
     onNewTask: async (job, memoToSign) => {
-      console.log("onNewTask fired:", job.id);
+      if (!memoToSign) return;
 
-      if (memoToSign) {
-        console.log("Memo to sign:", memoToSign.type, "nextPhase:", memoToSign.nextPhase);
+      if (memoToSign.nextPhase === 1) {
+        await job.respond(true);
+        return;
+      }
 
-        // Phase 0 → 1 (ACCEPT JOB)
-        if (memoToSign.nextPhase === 1) {
-          await job.respond(true);
-          console.log("Job accepted:", job.id);
-          return;
+      if (memoToSign.nextPhase === 3) {
+        if (processedJobs.has(job.id)) return;
+        processedJobs.add(job.id);
+
+        if (job.name === "dubcontent") {
+          await processDubbing(job);
         }
 
-        // Phase 2 → 3 (DELIVER SERVICE)
-        if (memoToSign.nextPhase === 3) {
-          if (processedJobs.has(job.id)) return;
-          processedJobs.add(job.id);
-
-          console.log("Processing dubbing for job:", job.id);
-          await processDubbing(job);
-          return;
+        if (job.name === "voiceover") {
+          await processVoiceover(job);
         }
       }
     },
 
     onEvaluate: async (job) => {
-      console.log("Evaluation phase reached:", job.id, "phase:", job.phase);
-
       if (job.phase !== 3) return;
 
       try {
-        await job.evaluate(true, "Dubbing completed successfully");
-        console.log("Job completed:", job.id);
+        await job.evaluate(true, "Service completed successfully");
       } catch (err) {
         console.error("Evaluation error:", err);
       }
-    },
+    }
   });
 
   await acpClient.init();
-  console.log("ACP seller running...");
+  console.log("ACP agent running...");
 }
 
 main().catch(console.error);
