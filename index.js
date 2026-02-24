@@ -269,7 +269,8 @@ async function processPremiumMusic(job) {
     genre,
     mood,
     vocalStyle,
-    duration
+    duration,
+    lyrics
   } = job.requirement || job.serviceRequirement || {};
 
   if (!concept || !genre || !mood || !vocalStyle || !duration) {
@@ -285,13 +286,30 @@ async function processPremiumMusic(job) {
   }
 
   try {
+    // ✅ Safe duration handling (3s min, 280s max)
+    const durationMs = Math.max(
+      3000,
+      Math.min(280000, parseInt(duration) * 1000 || 60000)
+    );
+
     const finalPrompt = `
 Create a professionally produced ${genre} track.
 Theme: ${concept}.
 Mood: ${mood}.
 Vocals: ${vocalStyle}.
+${lyrics && lyrics.trim() !== ""
+  ? `Use the following lyrics exactly as written:\n${lyrics}`
+  : "Generate original lyrics appropriate to the theme."}
 High quality production, radio-ready mix, cinematic depth, modern sound design.
 `;
+
+    console.log("Generating music:", {
+      concept,
+      genre,
+      mood,
+      vocalStyle,
+      duration: durationMs
+    });
 
     const response = await fetch(
       "https://api.elevenlabs.io/v1/music?output_format=mp3_44100_128",
@@ -303,7 +321,7 @@ High quality production, radio-ready mix, cinematic depth, modern sound design.
         },
         body: JSON.stringify({
           prompt: finalPrompt,
-          music_length_ms: parseInt(duration) * 1000,
+          music_length_ms: durationMs,
           model_id: "music_v1",
           force_instrumental:
             vocalStyle.toLowerCase() === "instrumental"
@@ -315,8 +333,7 @@ High quality production, radio-ready mix, cinematic depth, modern sound design.
       throw new Error("Music generation failed");
     }
 
-    const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
+    const buffer = Buffer.from(await response.arrayBuffer());
 
     const key = `music/${job.id}.mp3`;
     const url = await uploadToS3(buffer, key, "audio/mpeg");
