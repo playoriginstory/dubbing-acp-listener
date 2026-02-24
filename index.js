@@ -378,7 +378,7 @@ async function main() {
           return;
         }
 
-        if (job.name === "premiummusic") {
+        if (job.name === "musicproduction") {
           await processPremiumMusic(job);
           return;
         }
