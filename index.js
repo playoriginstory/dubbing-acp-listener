@@ -390,7 +390,7 @@ async function main() {
         if (processedJobs.has(job.id)) return;
         processedJobs.add(job.id);
 
-        if (job.name === "dubcontent") {
+        if (job.name === "dubbing") {
           await processDubbing(job);
           return;
         }
