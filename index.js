@@ -1,5 +1,7 @@
 import pkg from "@virtuals-protocol/acp-node";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import FormData from "form-data";
+
 
 const { default: AcpClient, AcpContractClientV2 } = pkg;
 
@@ -398,18 +400,26 @@ async function processVoiceRecast(job) {
     if (audioBuffer.length > 25 * 1024 * 1024) {
       throw new Error("Audio file too large");
     }
-  
 
-    // Convert via ElevenLabs Speech-to-Speech
+    const formData = new FormData();
+
+  
+    formData.append("audio", audioBuffer, {
+      filename: "input.mp3",
+      contentType: "audio/mpeg"
+    });
+    
+    formData.append("model_id", "eleven_multilingual_sts_v2");
+    
     const elevenResponse = await fetch(
-      `https://api.elevenlabs.io/v1/speech-to-speech/${voiceId}?model_id=eleven_multilingual_sts_v2&output_format=mp3_44100_128`,
+      `https://api.elevenlabs.io/v1/speech-to-speech/${voiceId}?output_format=mp3_44100_128`,
       {
         method: "POST",
         headers: {
           "xi-api-key": process.env.ELEVENLABS_API_KEY,
-          "Content-Type": "audio/mpeg"
+          ...formData.getHeaders()
         },
-        body: audioBuffer
+        body: formData
       }
     );
 
