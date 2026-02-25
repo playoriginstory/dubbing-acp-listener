@@ -1,6 +1,7 @@
 import pkg from "@virtuals-protocol/acp-node";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import FormData from "form-data";
+import axios from "axios";
 import { Readable } from "stream";
 
 
@@ -405,35 +406,26 @@ async function processVoiceRecast(job) {
 
     const formData = new FormData();
 
-    const audioStream = Readable.from(audioBuffer);
-    
-    formData.append("audio", audioStream, {
+    formData.append("audio", Readable.from(audioBuffer), {
       filename: "input.mp3",
       contentType: "audio/mpeg"
     });
     
     formData.append("model_id", "eleven_multilingual_sts_v2");
     
-    const elevenResponse = await fetch(
+    const elevenResponse = await axios.post(
       `https://api.elevenlabs.io/v1/speech-to-speech/${voiceId}?output_format=mp3_44100_128`,
+      formData,
       {
-        method: "POST",
         headers: {
           "xi-api-key": process.env.ELEVENLABS_API_KEY,
           ...formData.getHeaders()
         },
-        body: formData
+        responseType: "arraybuffer"
       }
     );
-
-    if (!elevenResponse.ok) {
-      const errText = await elevenResponse.text();
-      console.error("ELEVEN ERROR:", errText);
-      throw new Error(errText);
-    }
-
-    const resultBuffer = Buffer.from(await elevenResponse.arrayBuffer());
-
+    
+    const resultBuffer = Buffer.from(elevenResponse.data);
     const key = `voicerecast/${job.id}.mp3`;
     const url = await uploadToS3(resultBuffer, key, "audio/mpeg");
 
