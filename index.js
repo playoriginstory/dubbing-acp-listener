@@ -1,6 +1,7 @@
 import pkg from "@virtuals-protocol/acp-node";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import FormData from "form-data";
+import { Readable } from "stream";
 
 
 const { default: AcpClient, AcpContractClientV2 } = pkg;
@@ -404,8 +405,9 @@ async function processVoiceRecast(job) {
 
     const formData = new FormData();
 
-  
-    formData.append("audio", audioBuffer, {
+    const audioStream = Readable.from(audioBuffer);
+    
+    formData.append("audio", audioStream, {
       filename: "input.mp3",
       contentType: "audio/mpeg"
     });
@@ -425,7 +427,9 @@ async function processVoiceRecast(job) {
     );
 
     if (!elevenResponse.ok) {
-      throw new Error("Voice recasting failed");
+      const errText = await elevenResponse.text();
+      console.error("ELEVEN ERROR:", errText);
+      throw new Error(errText);
     }
 
     const resultBuffer = Buffer.from(await elevenResponse.arrayBuffer());
