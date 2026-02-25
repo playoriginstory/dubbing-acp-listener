@@ -202,6 +202,7 @@ async function processVoiceover(job) {
     job.requirement || job.serviceRequirement || {};
 
   const voiceId = getVoiceId(voiceStyle);
+  
 
   if (!text) {
     await job.deliver({
@@ -363,6 +364,89 @@ High quality production, radio-ready mix, cinematic depth, modern sound design.
   }
 }
 
+/* -------------------------
+   VOICE RECASTING LOGIC
+-------------------------- */
+
+async function processVoiceRecast(job) {
+  const { audioUrl, voiceStyle } =
+    job.requirement || job.serviceRequirement || {};
+
+  const voiceId = getVoiceId(voiceStyle);
+
+  if (!audioUrl) {
+    await job.deliver({
+      type: "object",
+      value: {
+        jobId: job.id.toString(),
+        status: "failed",
+        audio: ""
+      }
+    });
+    return;
+  }
+
+  try {
+    console.log("Voice recasting started:", { audioUrl, voiceStyle });
+
+    // Fetch source audio
+    const sourceResponse = await fetch(audioUrl);
+    if (!sourceResponse.ok) throw new Error("Failed to fetch source audio");
+
+    const audioBuffer = Buffer.from(await sourceResponse.arrayBuffer());
+
+    if (audioBuffer.length > 25 * 1024 * 1024) {
+      throw new Error("Audio file too large");
+    }
+  
+
+    // Convert via ElevenLabs Speech-to-Speech
+    const elevenResponse = await fetch(
+      `https://api.elevenlabs.io/v1/speech-to-speech/${voiceId}?model_id=eleven_multilingual_sts_v2&output_format=mp3_44100_128`,
+      {
+        method: "POST",
+        headers: {
+          "xi-api-key": process.env.ELEVENLABS_API_KEY,
+          "Content-Type": "audio/mpeg"
+        },
+        body: audioBuffer
+      }
+    );
+
+    if (!elevenResponse.ok) {
+      throw new Error("Voice recasting failed");
+    }
+
+    const resultBuffer = Buffer.from(await elevenResponse.arrayBuffer());
+
+    const key = `voicerecast/${job.id}.mp3`;
+    const url = await uploadToS3(resultBuffer, key, "audio/mpeg");
+
+    await job.deliver({
+      type: "object",
+      value: {
+        jobId: job.id.toString(),
+        status: "completed",
+        audio: url
+      }
+    });
+
+    console.log("Voice recast delivered:", url);
+
+  } catch (err) {
+    console.error("Voice recast error:", err);
+
+    await job.deliver({
+      type: "object",
+      value: {
+        jobId: job.id.toString(),
+        status: "failed",
+        audio: ""
+      }
+    });
+  }
+}
+
 
 /* -------------------------
    ACP MAIN
@@ -394,16 +478,20 @@ async function main() {
           await processDubbing(job);
           return;
         }
-
+        
         if (job.name === "musicproduction") {
           await processPremiumMusic(job);
           return;
         }
-
+        
         if (job.name === "voiceover") {
           await processVoiceover(job);
           return;
-
+        }
+        
+        if (job.name === "voicerecast") {
+          await processVoiceRecast(job);
+          return;
         }
       }
     },
