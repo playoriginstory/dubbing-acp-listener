@@ -371,8 +371,9 @@ High quality production, radio-ready mix, cinematic depth, modern sound design.
 -------------------------- */
 
 async function processVoiceRecast(job) {
-  const { audioUrl, voiceStyle } =
-    job.requirement || job.serviceRequirement || {};
+  const { audioURL, voiceStyle } =
+  job.requirement || job.serviceRequirement || {};
+  const audioUrl = audioURL;
 
   const voiceId = getVoiceId(voiceStyle);
 
