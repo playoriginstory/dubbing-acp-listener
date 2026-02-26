@@ -95,6 +95,69 @@ async function uploadToS3(buffer, key, contentType) {
   return `https://${process.env.AWS_S3_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
 }
 
+function normalizeJobName(name) {
+  return (name || "").toLowerCase().trim();
+}
+
+function isValidUrl(u) {
+  try {
+    const url = new URL(u);
+    return ["http:", "https:"].includes(url.protocol);
+  } catch {
+    return false;
+  }
+}
+
+function validateRequirement(jobName, req) {
+  const name = normalizeJobName(jobName);
+  const r = req || {};
+
+  // IMPORTANT: your schema uses "audioURL" right now but code uses "audioUrl".
+  // Support BOTH to avoid breaking.
+  const audioUrl = r.audioUrl || r.audioURL;
+
+  if (name === "dubbing") {
+    if (!r.videoUrl || !isValidUrl(r.videoUrl)) return "Missing or invalid videoUrl (must be a public http/https URL).";
+    if (!r.targetLanguage) return "Missing targetLanguage.";
+    if (!getLanguageCode(r.targetLanguage)) return "Unsupported targetLanguage. Please use one of the supported 29 languages.";
+    return null;
+  }
+
+  if (name === "voiceover") {
+    if (!r.text || String(r.text).trim().length === 0) return "Missing text.";
+    // optional guardrail
+    if (String(r.text).length > 5000) return "Text too long (max 5000 chars).";
+    if (r.voiceStyle && !VOICE_MAP[String(r.voiceStyle).toLowerCase()]) {
+      return `Unsupported voiceStyle. Use one of: ${Object.keys(VOICE_MAP).join(", ")}.`;
+    }
+    return null;
+  }
+
+  if (name === "musicproduction") {
+    if (!r.concept) return "Missing concept.";
+    if (!r.genre) return "Missing genre.";
+    if (!r.mood) return "Missing mood.";
+    if (!r.vocalStyle) return "Missing vocalStyle.";
+    if (!r.duration) return "Missing duration (seconds).";
+    const dur = parseInt(r.duration, 10);
+    if (Number.isNaN(dur)) return "Invalid duration (must be a number in seconds).";
+    if (dur < 3 || dur > 280) return "Duration must be between 3 and 280 seconds.";
+    if (r.lyrics && String(r.lyrics).length > 4000) return "Lyrics too long (max 4000 chars).";
+    return null;
+  }
+
+  if (name === "voicerecast") {
+    if (!audioUrl || !isValidUrl(audioUrl)) return "Missing or invalid audioUrl/audioURL (must be a public http/https URL).";
+    if (!r.voiceStyle) return "Missing voiceStyle.";
+    if (!VOICE_MAP[String(r.voiceStyle).toLowerCase()]) {
+      return `Unsupported voiceStyle. Use one of: ${Object.keys(VOICE_MAP).join(", ")}.`;
+    }
+    return null;
+  }
+
+  return `Unknown job name "${jobName}".`;
+}
+
 /* -------------------------
    DUBBING LOGIC
 -------------------------- */
@@ -373,9 +436,9 @@ High quality production, radio-ready mix, cinematic depth, modern sound design.
 -------------------------- */
 
 async function processVoiceRecast(job) {
-  const { audioURL, voiceStyle } =
-  job.requirement || job.serviceRequirement || {};
-  const audioUrl = audioURL;
+  const req = job.requirement || job.serviceRequirement || {};
+  const audioUrl = req.audioUrl || req.audioURL;
+  const voiceStyle = req.voiceStyle;
 
   const voiceId = getVoiceId(voiceStyle);
 
@@ -441,8 +504,12 @@ async function processVoiceRecast(job) {
     console.log("Voice recast delivered:", url);
 
   } catch (err) {
-    console.error("Voice recast error:", err);
-
+    if (err.response) {
+      console.error("ELEVEN ERROR:", err.response.data?.toString());
+    } else {
+      console.error("Voice recast error:", err);
+    }
+  
     await job.deliver({
       type: "object",
       value: {
@@ -473,7 +540,19 @@ async function main() {
       if (!memoToSign) return;
 
       if (memoToSign.nextPhase === 1) {
+        const req = job.requirement || job.serviceRequirement || {};
+        const reason = validateRequirement(job.name, req);
+      
+        if (reason) {
+          console.log("Rejecting job (invalid requirement):", job.id, job.name, reason);
+          // If your SDK supports reject() here, do it:
+          return await job.reject(reason);
+          // If reject() is not available in your wrapper, tell me what methods exist on `job`
+          // and I'll map it exactly.
+        }
+      
         await job.respond(true);
+        console.log("Job accepted:", job.id, job.name);
         return;
       }
 
