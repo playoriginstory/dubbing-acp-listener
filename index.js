@@ -74,6 +74,57 @@ function getVoiceId(style) {
 
 const processedJobs = new Set();
 
+async function ensurePublicVideoUrl(originalUrl) {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30000); // 30s timeout
+
+    const response = await fetch(originalUrl, {
+      signal: controller.signal
+    });
+
+    clearTimeout(timeout);
+
+    if (!response.ok) {
+      throw new Error("Failed to download source file");
+    }
+
+    const contentType =
+      response.headers.get("content-type") || "application/octet-stream";
+
+      if (!contentType.includes("video") && !contentType.includes("audio")) {
+        throw new Error("URL does not point to a valid video/audio file");
+      }
+  
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    // 🔒 File size limit (100MB)
+    const MAX_SIZE = 100 * 1024 * 1024;
+    if (buffer.length > MAX_SIZE) {
+      throw new Error("File too large (max 100MB)");
+    }
+
+    // Infer extension from content type
+    let extension = "mp4";
+    if (contentType.includes("audio")) extension = "mp3";
+    if (contentType.includes("webm")) extension = "webm";
+    if (contentType.includes("quicktime")) extension = "mov";
+
+    const key = `source/${Date.now()}_${Math.random()
+      .toString(36)
+      .substring(7)}.${extension}`;
+
+    const publicUrl = await uploadToS3(buffer, key, contentType);
+
+    return publicUrl;
+
+  } catch (err) {
+    console.error("File normalization failed:", err.message);
+    throw err;
+  }
+}
+
 /* -------------------------
    S3 SETUP
 -------------------------- */
@@ -117,9 +168,31 @@ function validateRequirement(jobName, req) {
   const audioUrl = r.audioUrl || r.audioURL;
 
   if (name === "dubbing") {
-    if (!r.videoUrl || !isValidUrl(r.videoUrl)) return "Missing or invalid videoUrl (must be a public http/https URL).";
+    if (!r.videoUrl || !isValidUrl(r.videoUrl)) return "Missing or invalid videoUrl (must be a valid http/https URL).";
     if (!r.targetLanguage) return "Missing targetLanguage.";
     if (!getLanguageCode(r.targetLanguage)) return "Unsupported targetLanguage. Please use one of the supported 29 languages.";
+    return null;
+  }
+
+  if (name === "multidubbing") {
+    if (!r.videoUrl || !isValidUrl(r.videoUrl)) {
+      return "Missing or invalid videoUrl (must be a public http/https URL).";
+    }
+  
+    if (!Array.isArray(r.targetLanguages)) {
+      return "targetLanguages must be an array.";
+    }
+  
+    if (r.targetLanguages.length === 0 || r.targetLanguages.length > 3) {
+      return "You must provide between 1 and 3 targetLanguages.";
+    }
+  
+    for (const lang of r.targetLanguages) {
+      if (!getLanguageCode(lang)) {
+        return `Unsupported language: ${lang}`;
+      }
+    }
+  
     return null;
   }
 
@@ -163,7 +236,7 @@ function validateRequirement(jobName, req) {
 -------------------------- */
 
 async function processDubbing(job) {
-  const { videoUrl, targetLanguage } =
+  let { videoUrl, targetLanguage } =
     job.requirement || job.serviceRequirement || {};
 
   const langCode = getLanguageCode(targetLanguage);
@@ -181,6 +254,8 @@ async function processDubbing(job) {
   }
 
   try {
+    videoUrl = await ensurePublicVideoUrl(videoUrl);
+
     const dubRes = await fetch("https://duelsapp.vercel.app/api/dub", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -255,6 +330,106 @@ async function processDubbing(job) {
         jobId: job.id.toString(),
         status: "failed",
         dubbedFileUrl: ""
+      }
+    });
+  }
+}
+
+async function processMultiDubbing(job) {
+ let { videoUrl, targetLanguages } =
+  job.requirement || job.serviceRequirement || {};
+
+
+  try {
+    videoUrl = await ensurePublicVideoUrl(videoUrl);
+    const results = {};
+
+    for (const lang of targetLanguages) {
+      const langCode = getLanguageCode(lang);
+      if (!langCode) continue;
+
+      // Start dubbing job
+      const dubRes = await fetch("https://duelsapp.vercel.app/api/dub", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          videoUrl,
+          target_lang: langCode,
+          source_lang: "auto"
+        })
+      });
+
+      const dubData = await dubRes.json();
+      const dubbingId = dubData.dubbing_id;
+      if (!dubbingId) continue;
+
+      let dubbedUrl = "";
+
+      // Poll status
+      for (let i = 0; i < 24; i++) {
+        await new Promise(r => setTimeout(r, 10000));
+
+        const statusRes = await fetch(
+          `https://duelsapp.vercel.app/api/dub-status?id=${dubbingId}`
+        );
+
+        const statusData = await statusRes.json();
+
+        if (statusData.status === "dubbed") {
+          const elevenRes = await fetch(
+            `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/audio/${langCode}`,
+            {
+              headers: {
+                "xi-api-key": process.env.ELEVENLABS_API_KEY
+              }
+            }
+          );
+
+          if (!elevenRes.ok) break;
+
+          const buffer = Buffer.from(await elevenRes.arrayBuffer());
+          const contentType =
+            elevenRes.headers.get("content-type") || "audio/mpeg";
+
+          dubbedUrl = await uploadToS3(
+            buffer,
+            `multidub/${dubbingId}_${langCode}.mp3`,
+            contentType
+          );
+
+          break;
+        }
+
+        if (statusData.status === "failed") break;
+      }
+
+      if (dubbedUrl) {
+        results[langCode] = dubbedUrl;
+      }
+    }
+
+    if (Object.keys(results).length === 0) {
+      throw new Error("All dubbing attempts failed");
+    }
+
+    await job.deliver({
+      type: "object",
+      value: {
+        jobId: job.id.toString(),
+        status: "completed",
+        dubbedFiles: results
+      }
+    });
+
+  } catch (err) {
+    console.error("Multi-dubbing error:", err);
+
+    await job.deliver({
+      type: "object",
+      value: {
+        jobId: job.id.toString(),
+        status: "failed",
+        dubbedFiles: {}
       }
     });
   }
@@ -564,7 +739,13 @@ async function main() {
           await processDubbing(job);
           return;
         }
-        
+
+     
+        if (job.name === "multidubbing") {
+          await processMultiDubbing(job);
+          return;
+        }
+
         if (job.name === "musicproduction") {
           await processPremiumMusic(job);
           return;
