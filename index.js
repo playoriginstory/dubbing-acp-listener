@@ -272,6 +272,8 @@ async function processDubbing(job) {
     if (!dubbingId) throw new Error("No dubbing ID returned");
 
     let dubbedUrl = "";
+    let subtitleUrl = "";
+
 
     for (let i = 0; i < 24; i++) {
       await new Promise(r => setTimeout(r, 10000));
@@ -280,6 +282,7 @@ async function processDubbing(job) {
         `https://duelsapp.vercel.app/api/dub-status?id=${dubbingId}`
       );
 
+      
       const statusData = await statusRes.json();
 
       if (statusData.status === "dubbed") {
@@ -291,19 +294,44 @@ async function processDubbing(job) {
             }
           }
         );
-
+      
         if (!elevenRes.ok) throw new Error("Failed to fetch dubbed file");
-
+      
         const buffer = Buffer.from(await elevenRes.arrayBuffer());
         const contentType =
           elevenRes.headers.get("content-type") || "audio/mpeg";
-
+      
+        // Upload audio
         dubbedUrl = await uploadToS3(
           buffer,
           `dubbed/${dubbingId}_${langCode}.mp3`,
           contentType
         );
-
+      
+        // ✅ Fetch subtitles (SRT)
+        const transcriptRes = await fetch(
+          `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/transcripts/${langCode}/format/srt`,
+          {
+            headers: {
+              "xi-api-key": process.env.ELEVENLABS_API_KEY
+            }
+          }
+        );
+      
+        if (!transcriptRes.ok) {
+          throw new Error("Failed to fetch transcript");
+        }
+      
+        const srtText = await transcriptRes.text();
+      
+        const subtitleKey = `subtitles/${dubbingId}_${langCode}.srt`;
+      
+        subtitleUrl = await uploadToS3(
+          Buffer.from(srtText, "utf-8"),
+          subtitleKey,
+          "application/x-subrip"
+        );
+      
         break;
       }
 
@@ -317,7 +345,9 @@ async function processDubbing(job) {
       value: {
         jobId: job.id.toString(),
         status: "completed",
-        dubbedFileUrl: dubbedUrl
+        dubbedFileUrl: dubbedUrl,
+        subtitleUrl: subtitleUrl
+
       }
     });
 
@@ -364,6 +394,7 @@ async function processMultiDubbing(job) {
       if (!dubbingId) continue;
 
       let dubbedUrl = "";
+      let subtitleUrl = "";
 
       // Poll status
       for (let i = 0; i < 24; i++) {
@@ -385,8 +416,11 @@ async function processMultiDubbing(job) {
             }
           );
 
-          if (!elevenRes.ok) break;
-
+          if (!elevenRes.ok) {
+            console.error("Failed to fetch dubbed audio:", langCode);
+            break;
+          }
+          
           const buffer = Buffer.from(await elevenRes.arrayBuffer());
           const contentType =
             elevenRes.headers.get("content-type") || "audio/mpeg";
@@ -396,6 +430,28 @@ async function processMultiDubbing(job) {
             `multidub/${dubbingId}_${langCode}.mp3`,
             contentType
           );
+// Fetch subtitles (SRT)
+const transcriptRes = await fetch(
+  `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/transcripts/${langCode}/format/srt`,
+  {
+    headers: {
+      "xi-api-key": process.env.ELEVENLABS_API_KEY
+    }
+  }
+);
+
+if (!transcriptRes.ok) {
+  throw new Error("Failed to fetch transcript");
+}
+
+const srtText = await transcriptRes.text();
+
+subtitleUrl = await uploadToS3(
+  Buffer.from(srtText, "utf-8"),
+  `subtitles/${dubbingId}_${langCode}.srt`,
+  "application/x-subrip"
+);
+
 
           break;
         }
@@ -404,7 +460,10 @@ async function processMultiDubbing(job) {
       }
 
       if (dubbedUrl) {
-        results[langCode] = dubbedUrl;
+        results[langCode] = {
+          audio: dubbedUrl,
+          subtitles: subtitleUrl
+        };
       }
     }
 
