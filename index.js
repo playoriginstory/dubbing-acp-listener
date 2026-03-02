@@ -156,6 +156,13 @@ function normalizeJobName(name) {
   return (name || "").toLowerCase().trim();
 }
 
+function normalizeYouTubeUrl(url) {
+  // Convert: https://www.youtube.com/shorts/VIDEO_ID -> https://www.youtube.com/watch?v=VIDEO_ID
+  const m = url.match(/youtube\.com\/shorts\/([a-zA-Z0-9_-]+)/);
+  if (m?.[1]) return `https://www.youtube.com/watch?v=${m[1]}`;
+  return url;
+}
+
 function isValidUrl(u) {
   try {
     const url = new URL(u);
@@ -206,31 +213,41 @@ async function downloadYouTube(url) {
     try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch {}
     throw new Error("Failed to download YouTube video");
   }
-async function downloadYouTube(url) {
-  const outputPath = `/tmp/${Date.now()}.mp4`;
 
-  try {
-    // yt-dlp writes directly to outputPath
-    await execFileAsync("yt-dlp", [
-      "-f",
-      "mp4/bestvideo+bestaudio/best",
-      "--merge-output-format",
-      "mp4",
-      "-o",
-      outputPath,
-      url
-    ]);
-
-    const buffer = fs.readFileSync(outputPath);
-    fs.unlinkSync(outputPath);
-    return buffer;
-
-  } catch (err) {
-    console.error("yt-dlp failed:", err?.stderr || err);
-    // try to clean up if partial file exists
-    try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch {}
-    throw new Error("Failed to download YouTube video");
-  }
+  async function downloadYouTube(url) {
+    const outputPath = `/tmp/${Date.now()}.mp4`;
+    const normalizedUrl = normalizeYouTubeUrl(url);
+  
+    try {
+      const { stdout, stderr } = await execFileAsync("yt-dlp", [
+        "--no-playlist",
+        "--force-overwrites",
+        "-f",
+        "bv*+ba/best",              // ✅ more robust than forcing mp4 only
+        "--merge-output-format",
+        "mp4",
+        "-o",
+        outputPath,
+        normalizedUrl
+      ]);
+  
+      if (stdout) console.log("yt-dlp stdout:", stdout.slice(-2000));
+      if (stderr) console.log("yt-dlp stderr:", stderr.slice(-2000));
+  
+      const buffer = fs.readFileSync(outputPath);
+      fs.unlinkSync(outputPath);
+      return buffer;
+  
+    } catch (err) {
+      console.error("yt-dlp failed:", {
+        message: err?.message,
+        stdout: err?.stdout?.slice?.(-2000),
+        stderr: err?.stderr?.slice?.(-4000)
+      });
+  
+      try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch {}
+      throw new Error("Failed to download YouTube video (yt-dlp)");
+    }
 }
 }
 
