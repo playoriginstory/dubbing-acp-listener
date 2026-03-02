@@ -3,6 +3,8 @@ import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import FormData from "form-data";
 import axios from "axios";
 import { Readable } from "stream";
+import ytDlp from "yt-dlp-exec";
+import fs from "fs";
 
 
 const { default: AcpClient, AcpContractClientV2 } = pkg;
@@ -158,6 +160,83 @@ function isValidUrl(u) {
     return false;
   }
 }
+/* -------------------------
+   VIDEO LINK NORMALIZATION
+-------------------------- */
+
+function detectSourceType(url) {
+  if (url.includes("youtube.com") || url.includes("youtu.be")) {
+    return "youtube";
+  }
+  if (url.includes("drive.google.com")) {
+    return "gdrive";
+  }
+  if (url.includes("dropbox.com")) {
+    return "dropbox";
+  }
+  return "direct";
+}
+
+async function downloadYouTube(url) {
+  const outputPath = `/tmp/${Date.now()}.mp4`;
+
+  await ytDlp(url, {
+    output: outputPath,
+    format: "mp4/bestvideo+bestaudio/best",
+    mergeOutputFormat: "mp4"
+  });
+
+  const buffer = fs.readFileSync(outputPath);
+  fs.unlinkSync(outputPath); // clean up temp file
+
+  return buffer;
+}
+
+function transformGoogleDrive(url) {
+  const match = url.match(/\/d\/(.*?)\//);
+  if (!match) return url;
+
+  const fileId = match[1];
+  return `https://drive.google.com/uc?export=download&id=${fileId}`;
+}
+
+function transformDropbox(url) {
+  return url.replace("?dl=0", "?dl=1");
+}
+
+
+async function normalizeVideoInput(url) {
+  const type = detectSourceType(url);
+
+  let buffer;
+  let finalUrl = url;
+
+  if (type === "youtube") {
+    buffer = await downloadYouTube(url);
+  } else {
+    if (type === "gdrive") {
+      finalUrl = transformGoogleDrive(url);
+    }
+
+    if (type === "dropbox") {
+      finalUrl = transformDropbox(url);
+    }
+
+    const response = await fetch(finalUrl);
+    if (!response.ok) throw new Error("Download failed");
+
+    buffer = Buffer.from(await response.arrayBuffer());
+  }
+
+  if (buffer.length > 100 * 1024 * 1024) {
+    throw new Error("File too large (max 100MB)");
+  }
+
+  const key = `source/${Date.now()}.mp4`;
+
+  return await uploadToS3(buffer, key, "video/mp4");
+}
+
 
 function validateRequirement(jobName, req) {
   const name = normalizeJobName(jobName);
@@ -254,7 +333,7 @@ async function processDubbing(job) {
   }
 
   try {
-    videoUrl = await ensurePublicVideoUrl(videoUrl);
+    videoUrl = await normalizeVideoInput(videoUrl);
 
     const dubRes = await fetch("https://duelsapp.vercel.app/api/dub", {
       method: "POST",
@@ -371,7 +450,7 @@ async function processMultiDubbing(job) {
 
 
   try {
-    videoUrl = await ensurePublicVideoUrl(videoUrl);
+videoUrl = await normalizeVideoInput(videoUrl);
     const results = {};
 
     for (const lang of targetLanguages) {
@@ -420,7 +499,7 @@ async function processMultiDubbing(job) {
             console.error("Failed to fetch dubbed audio:", langCode);
             break;
           }
-          
+
           const buffer = Buffer.from(await elevenRes.arrayBuffer());
           const contentType =
             elevenRes.headers.get("content-type") || "audio/mpeg";
