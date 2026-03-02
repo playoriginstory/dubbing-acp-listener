@@ -3,8 +3,12 @@ import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import FormData from "form-data";
 import axios from "axios";
 import { Readable } from "stream";
-import ytDlp from "yt-dlp-exec";
+import { execFile } from "child_process";
+import { promisify } from "util";
 import fs from "fs";
+
+const execFileAsync = promisify(execFile);
+
 
 
 const { default: AcpClient, AcpContractClientV2 } = pkg;
@@ -180,16 +184,54 @@ function detectSourceType(url) {
 async function downloadYouTube(url) {
   const outputPath = `/tmp/${Date.now()}.mp4`;
 
-  await ytDlp(url, {
-    output: outputPath,
-    format: "mp4/bestvideo+bestaudio/best",
-    mergeOutputFormat: "mp4"
-  });
+  try {
+    // yt-dlp writes directly to outputPath
+    await execFileAsync("yt-dlp", [
+      "-f",
+      "mp4/bestvideo+bestaudio/best",
+      "--merge-output-format",
+      "mp4",
+      "-o",
+      outputPath,
+      url
+    ]);
 
-  const buffer = fs.readFileSync(outputPath);
-  fs.unlinkSync(outputPath); // clean up temp file
+    const buffer = fs.readFileSync(outputPath);
+    fs.unlinkSync(outputPath);
+    return buffer;
 
-  return buffer;
+  } catch (err) {
+    console.error("yt-dlp failed:", err?.stderr || err);
+    // try to clean up if partial file exists
+    try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch {}
+    throw new Error("Failed to download YouTube video");
+  }
+async function downloadYouTube(url) {
+  const outputPath = `/tmp/${Date.now()}.mp4`;
+
+  try {
+    // yt-dlp writes directly to outputPath
+    await execFileAsync("yt-dlp", [
+      "-f",
+      "mp4/bestvideo+bestaudio/best",
+      "--merge-output-format",
+      "mp4",
+      "-o",
+      outputPath,
+      url
+    ]);
+
+    const buffer = fs.readFileSync(outputPath);
+    fs.unlinkSync(outputPath);
+    return buffer;
+
+  } catch (err) {
+    console.error("yt-dlp failed:", err?.stderr || err);
+    // try to clean up if partial file exists
+    try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch {}
+    throw new Error("Failed to download YouTube video");
+  }
+}
 }
 
 function transformGoogleDrive(url) {
