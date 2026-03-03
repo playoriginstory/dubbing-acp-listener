@@ -193,7 +193,7 @@ async function downloadYouTube(url) {
 
   try {
     // yt-dlp writes directly to outputPath
-    await execFileAsync("yt-dlp", [
+    await execFileAsync("./bin/yt-dlp", [
       "-f",
       "mp4/bestvideo+bestaudio/best",
       "--merge-output-format",
@@ -219,7 +219,7 @@ async function downloadYouTube(url) {
     const normalizedUrl = normalizeYouTubeUrl(url);
   
     try {
-      const { stdout, stderr } = await execFileAsync("yt-dlp", [
+      const { stdout, stderr } = await execFileAsync("./bin/yt-dlp", [
         "--no-playlist",
         "--force-overwrites",
         "-f",
