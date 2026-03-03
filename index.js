@@ -9,7 +9,6 @@ if (process.env.YOUTUBE_COOKIES) {
   fs.writeFileSync("/tmp/youtube_cookies.txt", process.env.YOUTUBE_COOKIES);
 }
 
-const execFileAsync = promisify(execFile);
 
 
 
