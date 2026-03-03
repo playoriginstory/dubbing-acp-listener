@@ -194,20 +194,52 @@ function transformDropbox(url) {
   return url.replace("?dl=0", "?dl=1");
 }
 
+function extractGoogleDriveId(url) {
+  // Handles:
+  // /file/d/FILE_ID/view
+  // open?id=FILE_ID
+  const fileMatch = url.match(/\/file\/d\/([^/]+)/);
+  if (fileMatch) return fileMatch[1];
+
+  const openMatch = url.match(/[?&]id=([^&]+)/);
+  if (openMatch) return openMatch[1];
+
+  return null;
+}
 
 async function normalizeVideoInput(url) {
-  // Block YouTube completely
+  // 🚫 Block YouTube
   if (url.includes("youtube.com") || url.includes("youtu.be")) {
-    throw new Error("YouTube links are not supported. Please upload a direct video file.");
+    throw new Error(
+      "YouTube links are not supported. Please upload a direct video file."
+    );
+  }
+
+  // ✅ Google Drive conversion
+  if (url.includes("drive.google.com")) {
+    const fileId = extractGoogleDriveId(url);
+
+    if (!fileId) {
+      throw new Error("Invalid Google Drive link format.");
+    }
+
+    url = `https://drive.google.com/uc?export=download&id=${fileId}`;
   }
 
   const response = await fetch(url);
 
   if (!response.ok) {
-    throw new Error("Download failed. Make sure the file is publicly accessible.");
+    throw new Error("Download failed. Make sure the file is public.");
   }
 
   const contentType = response.headers.get("content-type") || "";
+
+  // 🚨 Drive large file warning page returns HTML
+  if (contentType.includes("text/html")) {
+    throw new Error(
+      "Google Drive link is not a direct download. The file may be too large or not public."
+    );
+  }
 
   if (!contentType.includes("video") && !contentType.includes("audio")) {
     throw new Error("URL does not point to a valid video/audio file.");
@@ -216,7 +248,7 @@ async function normalizeVideoInput(url) {
   const buffer = Buffer.from(await response.arrayBuffer());
 
   if (buffer.length > 100 * 1024 * 1024) {
-    throw new Error("File too large (max 100MB)");
+    throw new Error("File too large (max 100MB).");
   }
 
   const key = `source/${Date.now()}.mp4`;
