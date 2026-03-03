@@ -187,68 +187,43 @@ function detectSourceType(url) {
   }
   return "direct";
 }
-
 async function downloadYouTube(url) {
   const outputPath = `/tmp/${Date.now()}.mp4`;
+  const normalizedUrl = normalizeYouTubeUrl(url);
 
   try {
-    // yt-dlp writes directly to outputPath
-    await execFileAsync("./bin/yt-dlp", [
+    const { stdout, stderr } = await execFileAsync("./bin/yt-dlp", [
+      "--no-playlist",
+      "--force-overwrites",
       "-f",
-      "mp4/bestvideo+bestaudio/best",
+      "bv*+ba/best",
       "--merge-output-format",
       "mp4",
       "-o",
       outputPath,
-      url
+      normalizedUrl
     ]);
+
+    if (stdout) console.log("yt-dlp stdout:", stdout.slice(-2000));
+    if (stderr) console.log("yt-dlp stderr:", stderr.slice(-2000));
 
     const buffer = fs.readFileSync(outputPath);
     fs.unlinkSync(outputPath);
     return buffer;
 
   } catch (err) {
-    console.error("yt-dlp failed:", err?.stderr || err);
-    // try to clean up if partial file exists
-    try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch {}
-    throw new Error("Failed to download YouTube video");
-  }
+    console.error("yt-dlp failed:", {
+      message: err?.message,
+      stdout: err?.stdout?.slice?.(-2000),
+      stderr: err?.stderr?.slice?.(-4000)
+    });
 
-  async function downloadYouTube(url) {
-    const outputPath = `/tmp/${Date.now()}.mp4`;
-    const normalizedUrl = normalizeYouTubeUrl(url);
-  
     try {
-      const { stdout, stderr } = await execFileAsync("./bin/yt-dlp", [
-        "--no-playlist",
-        "--force-overwrites",
-        "-f",
-        "bv*+ba/best",              // ✅ more robust than forcing mp4 only
-        "--merge-output-format",
-        "mp4",
-        "-o",
-        outputPath,
-        normalizedUrl
-      ]);
-  
-      if (stdout) console.log("yt-dlp stdout:", stdout.slice(-2000));
-      if (stderr) console.log("yt-dlp stderr:", stderr.slice(-2000));
-  
-      const buffer = fs.readFileSync(outputPath);
-      fs.unlinkSync(outputPath);
-      return buffer;
-  
-    } catch (err) {
-      console.error("yt-dlp failed:", {
-        message: err?.message,
-        stdout: err?.stdout?.slice?.(-2000),
-        stderr: err?.stderr?.slice?.(-4000)
-      });
-  
-      try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch {}
-      throw new Error("Failed to download YouTube video (yt-dlp)");
-    }
-}
+      if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+    } catch {}
+
+    throw new Error("Failed to download YouTube video (yt-dlp)");
+  }
 }
 
 function transformGoogleDrive(url) {
@@ -388,7 +363,7 @@ async function processDubbing(job) {
         dubbedFileUrl: ""
       }
     });
-    return;
+    return false ;
   }
 
   try {
@@ -489,6 +464,8 @@ async function processDubbing(job) {
       }
     });
 
+    return true;
+
   } catch (err) {
     console.error("Dubbing error:", err);
 
@@ -500,6 +477,8 @@ async function processDubbing(job) {
         dubbedFileUrl: ""
       }
     });
+    return false;
+
   }
 }
 
@@ -617,6 +596,7 @@ subtitleUrl = await uploadToS3(
         dubbedFiles: results
       }
     });
+    return true;
 
   } catch (err) {
     console.error("Multi-dubbing error:", err);
@@ -629,6 +609,8 @@ subtitleUrl = await uploadToS3(
         dubbedFiles: {}
       }
     });
+    return false;
+    
   }
 }
 
@@ -652,7 +634,7 @@ async function processVoiceover(job) {
         audio: ""
       }
     });
-    return;
+    return false;
   }
 
   try {
@@ -686,6 +668,7 @@ async function processVoiceover(job) {
         audio: url
       }
     });
+    return true;
 
     console.log("Voiceover delivered:", url);
 
@@ -700,6 +683,7 @@ async function processVoiceover(job) {
         audio: ""
       }
     });
+    return false;
   }
 }
 
@@ -722,7 +706,7 @@ async function processPremiumMusic(job) {
         audio: ""
       }
     });
-    return;
+    return false;
   }
 
   try {
@@ -787,6 +771,8 @@ High quality production, radio-ready mix, cinematic depth, modern sound design.
       }
     });
 
+    return true;
+
     console.log("Premium music delivered:", url);
 
   } catch (err) {
@@ -800,6 +786,7 @@ High quality production, radio-ready mix, cinematic depth, modern sound design.
         audio: ""
       }
     });
+    return false;
   }
 }
 
@@ -823,7 +810,7 @@ async function processVoiceRecast(job) {
         audio: ""
       }
     });
-    return;
+    return false;
   }
 
   try {
@@ -872,6 +859,7 @@ async function processVoiceRecast(job) {
         audio: url
       }
     });
+    return true;
 
     console.log("Voice recast delivered:", url);
 
@@ -890,6 +878,7 @@ async function processVoiceRecast(job) {
         audio: ""
       }
     });
+    return false;
   }
 }
 
@@ -911,64 +900,69 @@ async function main() {
     onNewTask: async (job, memoToSign) => {
       if (!memoToSign) return;
 
+      // --------------------
+      // Phase 1: accept/reject
+      // --------------------
       if (memoToSign.nextPhase === 1) {
         const req = job.requirement || job.serviceRequirement || {};
         const reason = validateRequirement(job.name, req);
-      
+
         if (reason) {
           console.log("Rejecting job (invalid requirement):", job.id, job.name, reason);
-          // If your SDK supports reject() here, do it:
+          // Rejecting here should prevent escrow from finalizing to seller.
           return await job.reject(reason);
-          // If reject() is not available in your wrapper, tell me what methods exist on `job`
-          // and I'll map it exactly.
         }
-      
+
         await job.respond(true);
         console.log("Job accepted:", job.id, job.name);
         return;
       }
 
+      // --------------------
+      // Phase 3: process + deliver + evaluate
+      // --------------------
       if (memoToSign.nextPhase === 3) {
         if (processedJobs.has(job.id)) return;
         processedJobs.add(job.id);
 
-        if (job.name === "dubbing") {
-          await processDubbing(job);
-          return;
+        let ok = false;
+
+        try {
+          if (job.name === "dubbing") {
+            ok = await processDubbing(job);         // MUST return true/false
+          } else if (job.name === "multidubbing") {
+            ok = await processMultiDubbing(job);    // MUST return true/false
+          } else if (job.name === "musicproduction") {
+            ok = await processPremiumMusic(job);    // MUST return true/false
+          } else if (job.name === "voiceover") {
+            ok = await processVoiceover(job);       // MUST return true/false
+          } else if (job.name === "voicerecast") {
+            ok = await processVoiceRecast(job);     // MUST return true/false
+          } else {
+            console.log("Unknown job name:", job.name);
+            ok = false;
+          }
+        } catch (err) {
+          console.error("Processing error:", job.id, job.name, err);
+          ok = false;
         }
 
-     
-        if (job.name === "multidubbing") {
-          await processMultiDubbing(job);
-          return;
+        // ✅ Settlement: only pay on success, refund on failure
+        try {
+          if (ok) {
+            await job.evaluate(true, "Service completed successfully");
+          } else {
+            await job.evaluate(false, "Service failed");
+          }
+        } catch (err) {
+          console.error("Evaluation error:", err);
         }
 
-        if (job.name === "musicproduction") {
-          await processPremiumMusic(job);
-          return;
-        }
-        
-        if (job.name === "voiceover") {
-          await processVoiceover(job);
-          return;
-        }
-        
-        if (job.name === "voicerecast") {
-          await processVoiceRecast(job);
-          return;
-        }
-      }
-    },
-
-    onEvaluate: async (job) => {
-      if (job.phase !== 3) return;
-
-      try {
-        await job.evaluate(true, "Service completed successfully");
-      } catch (err) {
-        console.error("Evaluation error:", err);
+        return;
       }
     }
+
+
   });
 
   await acpClient.init();
