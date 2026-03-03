@@ -7,6 +7,10 @@ import { execFile } from "child_process";
 import { promisify } from "util";
 import fs from "fs";
 
+if (process.env.YOUTUBE_COOKIES) {
+  fs.writeFileSync("/tmp/youtube_cookies.txt", process.env.YOUTUBE_COOKIES);
+}
+
 const execFileAsync = promisify(execFile);
 
 
@@ -193,6 +197,8 @@ async function downloadYouTube(url) {
 
   try {
     const { stdout, stderr } = await execFileAsync("./bin/yt-dlp", [
+      "--cookies",
+      "/tmp/youtube_cookies.txt",
       "--no-playlist",
       "--force-overwrites",
       "-f",
