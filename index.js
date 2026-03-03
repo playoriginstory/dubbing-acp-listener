@@ -3,8 +3,6 @@ import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import FormData from "form-data";
 import axios from "axios";
 import { Readable } from "stream";
-import { execFile } from "child_process";
-import { promisify } from "util";
 import fs from "fs";
 
 if (process.env.YOUTUBE_COOKIES) {
@@ -160,12 +158,6 @@ function normalizeJobName(name) {
   return (name || "").toLowerCase().trim();
 }
 
-function normalizeYouTubeUrl(url) {
-  // Convert: https://www.youtube.com/shorts/VIDEO_ID -> https://www.youtube.com/watch?v=VIDEO_ID
-  const m = url.match(/youtube\.com\/shorts\/([a-zA-Z0-9_-]+)/);
-  if (m?.[1]) return `https://www.youtube.com/watch?v=${m[1]}`;
-  return url;
-}
 
 function isValidUrl(u) {
   try {
@@ -180,9 +172,6 @@ function isValidUrl(u) {
 -------------------------- */
 
 function detectSourceType(url) {
-  if (url.includes("youtube.com") || url.includes("youtu.be")) {
-    return "youtube";
-  }
   if (url.includes("drive.google.com")) {
     return "gdrive";
   }
@@ -191,46 +180,7 @@ function detectSourceType(url) {
   }
   return "direct";
 }
-async function downloadYouTube(url) {
-  const outputPath = `/tmp/${Date.now()}.mp4`;
-  const normalizedUrl = normalizeYouTubeUrl(url);
 
-  try {
-    const { stdout, stderr } = await execFileAsync("./bin/yt-dlp", [
-      "--cookies",
-      "/tmp/youtube_cookies.txt",
-      "--no-playlist",
-      "--force-overwrites",
-      "-f",
-      "bv*+ba/best",
-      "--merge-output-format",
-      "mp4",
-      "-o",
-      outputPath,
-      normalizedUrl
-    ]);
-
-    if (stdout) console.log("yt-dlp stdout:", stdout.slice(-2000));
-    if (stderr) console.log("yt-dlp stderr:", stderr.slice(-2000));
-
-    const buffer = fs.readFileSync(outputPath);
-    fs.unlinkSync(outputPath);
-    return buffer;
-
-  } catch (err) {
-    console.error("yt-dlp failed:", {
-      message: err?.message,
-      stdout: err?.stdout?.slice?.(-2000),
-      stderr: err?.stderr?.slice?.(-4000)
-    });
-
-    try {
-      if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
-    } catch {}
-
-    throw new Error("Failed to download YouTube video (yt-dlp)");
-  }
-}
 
 function transformGoogleDrive(url) {
   const match = url.match(/\/d\/(.*?)\//);
@@ -246,27 +196,24 @@ function transformDropbox(url) {
 
 
 async function normalizeVideoInput(url) {
-  const type = detectSourceType(url);
-
-  let buffer;
-  let finalUrl = url;
-
-  if (type === "youtube") {
-    buffer = await downloadYouTube(url);
-  } else {
-    if (type === "gdrive") {
-      finalUrl = transformGoogleDrive(url);
-    }
-
-    if (type === "dropbox") {
-      finalUrl = transformDropbox(url);
-    }
-
-    const response = await fetch(finalUrl);
-    if (!response.ok) throw new Error("Download failed");
-
-    buffer = Buffer.from(await response.arrayBuffer());
+  // Block YouTube completely
+  if (url.includes("youtube.com") || url.includes("youtu.be")) {
+    throw new Error("YouTube links are not supported. Please upload a direct video file.");
   }
+
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error("Download failed. Make sure the file is publicly accessible.");
+  }
+
+  const contentType = response.headers.get("content-type") || "";
+
+  if (!contentType.includes("video") && !contentType.includes("audio")) {
+    throw new Error("URL does not point to a valid video/audio file.");
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
 
   if (buffer.length > 100 * 1024 * 1024) {
     throw new Error("File too large (max 100MB)");
@@ -274,9 +221,8 @@ async function normalizeVideoInput(url) {
 
   const key = `source/${Date.now()}.mp4`;
 
-  return await uploadToS3(buffer, key, "video/mp4");
+  return await uploadToS3(buffer, key, contentType);
 }
-
 
 function validateRequirement(jobName, req) {
   const name = normalizeJobName(jobName);
@@ -366,13 +312,33 @@ async function processDubbing(job) {
       value: {
         jobId: job.id.toString(),
         status: "failed",
+        reason: "Missing videoUrl or invalid targetLanguage",
         dubbedFileUrl: ""
       }
     });
-    return false ;
+    return false;
   }
 
   try {
+    // 🚫 Block YouTube FIRST
+    if (
+      videoUrl.includes("youtube.com") ||
+      videoUrl.includes("youtu.be")
+    ) {
+      await job.deliver({
+        type: "object",
+        value: {
+          jobId: job.id.toString(),
+          status: "failed",
+          reason:
+            "YouTube links are not supported. Please upload a direct video file.",
+          dubbedFileUrl: ""
+        }
+      });
+      return false;
+    }
+
+    // ✅ Only normalize AFTER blocking
     videoUrl = await normalizeVideoInput(videoUrl);
 
     const dubRes = await fetch("https://duelsapp.vercel.app/api/dub", {
@@ -384,6 +350,7 @@ async function processDubbing(job) {
         source_lang: "auto"
       })
     });
+
 
     const dubData = await dubRes.json();
     const dubbingId = dubData.dubbing_id;
@@ -489,19 +456,51 @@ async function processDubbing(job) {
 }
 
 async function processMultiDubbing(job) {
- let { videoUrl, targetLanguages } =
-  job.requirement || job.serviceRequirement || {};
+  let { videoUrl, targetLanguages } =
+    job.requirement || job.serviceRequirement || {};
 
+  // Basic validation safety
+  if (!videoUrl || !Array.isArray(targetLanguages) || targetLanguages.length === 0) {
+    await job.deliver({
+      type: "object",
+      value: {
+        jobId: job.id.toString(),
+        status: "failed",
+        reason: "Missing videoUrl or targetLanguages",
+        dubbedFiles: {}
+      }
+    });
+    return false;
+  }
 
   try {
-videoUrl = await normalizeVideoInput(videoUrl);
+    // 🚫 Block YouTube FIRST
+    if (
+      videoUrl.includes("youtube.com") ||
+      videoUrl.includes("youtu.be")
+    ) {
+      await job.deliver({
+        type: "object",
+        value: {
+          jobId: job.id.toString(),
+          status: "failed",
+          reason:
+            "YouTube links are not supported. Please upload a direct video file.",
+          dubbedFiles: {}
+        }
+      });
+      return false;
+    }
+
+    // ✅ Only normalize AFTER blocking
+    videoUrl = await normalizeVideoInput(videoUrl);
+
     const results = {};
 
     for (const lang of targetLanguages) {
       const langCode = getLanguageCode(lang);
       if (!langCode) continue;
 
-      // Start dubbing job
       const dubRes = await fetch("https://duelsapp.vercel.app/api/dub", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -539,10 +538,7 @@ videoUrl = await normalizeVideoInput(videoUrl);
             }
           );
 
-          if (!elevenRes.ok) {
-            console.error("Failed to fetch dubbed audio:", langCode);
-            break;
-          }
+          if (!elevenRes.ok) break;
 
           const buffer = Buffer.from(await elevenRes.arrayBuffer());
           const contentType =
@@ -553,28 +549,24 @@ videoUrl = await normalizeVideoInput(videoUrl);
             `multidub/${dubbingId}_${langCode}.mp3`,
             contentType
           );
-// Fetch subtitles (SRT)
-const transcriptRes = await fetch(
-  `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/transcripts/${langCode}/format/srt`,
-  {
-    headers: {
-      "xi-api-key": process.env.ELEVENLABS_API_KEY
-    }
-  }
-);
 
-if (!transcriptRes.ok) {
-  throw new Error("Failed to fetch transcript");
-}
+          const transcriptRes = await fetch(
+            `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/transcripts/${langCode}/format/srt`,
+            {
+              headers: {
+                "xi-api-key": process.env.ELEVENLABS_API_KEY
+              }
+            }
+          );
 
-const srtText = await transcriptRes.text();
-
-subtitleUrl = await uploadToS3(
-  Buffer.from(srtText, "utf-8"),
-  `subtitles/${dubbingId}_${langCode}.srt`,
-  "application/x-subrip"
-);
-
+          if (transcriptRes.ok) {
+            const srtText = await transcriptRes.text();
+            subtitleUrl = await uploadToS3(
+              Buffer.from(srtText, "utf-8"),
+              `subtitles/${dubbingId}_${langCode}.srt`,
+              "application/x-subrip"
+            );
+          }
 
           break;
         }
@@ -591,7 +583,16 @@ subtitleUrl = await uploadToS3(
     }
 
     if (Object.keys(results).length === 0) {
-      throw new Error("All dubbing attempts failed");
+      await job.deliver({
+        type: "object",
+        value: {
+          jobId: job.id.toString(),
+          status: "failed",
+          reason: "All dubbing attempts failed",
+          dubbedFiles: {}
+        }
+      });
+      return false;
     }
 
     await job.deliver({
@@ -602,6 +603,7 @@ subtitleUrl = await uploadToS3(
         dubbedFiles: results
       }
     });
+
     return true;
 
   } catch (err) {
@@ -612,11 +614,12 @@ subtitleUrl = await uploadToS3(
       value: {
         jobId: job.id.toString(),
         status: "failed",
+        reason: "Processing error occurred",
         dubbedFiles: {}
       }
     });
+
     return false;
-    
   }
 }
 
