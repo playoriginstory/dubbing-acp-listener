@@ -901,15 +901,14 @@ async function main() {
       if (!memoToSign) return;
 
       // --------------------
-      // Phase 1: accept/reject
+      // Phase 1: Accept / Reject
       // --------------------
       if (memoToSign.nextPhase === 1) {
         const req = job.requirement || job.serviceRequirement || {};
         const reason = validateRequirement(job.name, req);
 
         if (reason) {
-          console.log("Rejecting job (invalid requirement):", job.id, job.name, reason);
-          // Rejecting here should prevent escrow from finalizing to seller.
+          console.log("Rejecting job:", job.id, reason);
           return await job.reject(reason);
         }
 
@@ -919,41 +918,48 @@ async function main() {
       }
 
       // --------------------
-      // Phase 3: process + deliver + evaluate
+      // Phase 3: Process + Deliver ONLY
       // --------------------
       if (memoToSign.nextPhase === 3) {
         if (processedJobs.has(job.id)) return;
         processedJobs.add(job.id);
 
-        let ok = false;
-
         try {
           if (job.name === "dubbing") {
-            ok = await processDubbing(job);         // MUST return true/false
+            await processDubbing(job);
           } else if (job.name === "multidubbing") {
-            ok = await processMultiDubbing(job);    // MUST return true/false
+            await processMultiDubbing(job);
           } else if (job.name === "musicproduction") {
-            ok = await processPremiumMusic(job);    // MUST return true/false
+            await processPremiumMusic(job);
           } else if (job.name === "voiceover") {
-            ok = await processVoiceover(job);       // MUST return true/false
+            await processVoiceover(job);
           } else if (job.name === "voicerecast") {
-            ok = await processVoiceRecast(job);     // MUST return true/false
+            await processVoiceRecast(job);
           } else {
-            console.log("Unknown job name:", job.name);
-            ok = false;
+            console.log("Unknown job:", job.name);
           }
         } catch (err) {
-          console.error("Processing error:", job.id, job.name, err);
-          ok = false;
+          console.error("Processing error:", err);
         }
 
-        // ✅ Settlement: only pay on success, refund on failure
+        return; // 🔥 DO NOT evaluate here
+      }
+
+      // --------------------
+      // Phase 4: Evaluate (Release or Refund Escrow)
+      // --------------------
+      if (memoToSign.nextPhase === 4) {
         try {
-          if (ok) {
+          const success = job.result?.status === "completed";
+
+          if (success) {
             await job.evaluate(true, "Service completed successfully");
+            console.log("Escrow released:", job.id);
           } else {
             await job.evaluate(false, "Service failed");
+            console.log("Escrow refunded:", job.id);
           }
+
         } catch (err) {
           console.error("Evaluation error:", err);
         }
@@ -961,8 +967,6 @@ async function main() {
         return;
       }
     }
-
-
   });
 
   await acpClient.init();
