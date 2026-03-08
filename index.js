@@ -1,18 +1,21 @@
 import pkg from "@virtuals-protocol/acp-node";
+import { ElevenLabsClient } from "@elevenlabs/elevenlabs-js";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
-import FormData from "form-data";
-import axios from "axios";
-import { Readable } from "stream";
 import fs from "fs";
 
 if (process.env.YOUTUBE_COOKIES) {
   fs.writeFileSync("/tmp/youtube_cookies.txt", process.env.YOUTUBE_COOKIES);
 }
 
-
-
-
 const { default: AcpClient, AcpContractClientV2 } = pkg;
+
+/* -------------------------
+   ELEVENLABS CLIENT
+-------------------------- */
+
+const elevenlabs = new ElevenLabsClient({
+  apiKey: process.env.ELEVENLABS_API_KEY
+});
 
 /* -------------------------
    LANGUAGE LIST (DUBBING)
@@ -81,57 +84,6 @@ function getVoiceId(style) {
 
 const processedJobs = new Set();
 
-async function ensurePublicVideoUrl(originalUrl) {
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 30000); // 30s timeout
-
-    const response = await fetch(originalUrl, {
-      signal: controller.signal
-    });
-
-    clearTimeout(timeout);
-
-    if (!response.ok) {
-      throw new Error("Failed to download source file");
-    }
-
-    const contentType =
-      response.headers.get("content-type") || "application/octet-stream";
-
-      if (!contentType.includes("video") && !contentType.includes("audio")) {
-        throw new Error("URL does not point to a valid video/audio file");
-      }
-  
-    const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-
-    // 🔒 File size limit (100MB)
-    const MAX_SIZE = 100 * 1024 * 1024;
-    if (buffer.length > MAX_SIZE) {
-      throw new Error("File too large (max 100MB)");
-    }
-
-    // Infer extension from content type
-    let extension = "mp4";
-    if (contentType.includes("audio")) extension = "mp3";
-    if (contentType.includes("webm")) extension = "webm";
-    if (contentType.includes("quicktime")) extension = "mov";
-
-    const key = `source/${Date.now()}_${Math.random()
-      .toString(36)
-      .substring(7)}.${extension}`;
-
-    const publicUrl = await uploadToS3(buffer, key, contentType);
-
-    return publicUrl;
-
-  } catch (err) {
-    console.error("File normalization failed:", err.message);
-    throw err;
-  }
-}
-
 /* -------------------------
    S3 SETUP
 -------------------------- */
@@ -149,14 +101,12 @@ async function uploadToS3(buffer, key, contentType) {
       ContentType: contentType
     })
   );
-
   return `https://${process.env.AWS_S3_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
 }
 
 function normalizeJobName(name) {
   return (name || "").toLowerCase().trim();
 }
-
 
 function isValidUrl(u) {
   try {
@@ -166,66 +116,56 @@ function isValidUrl(u) {
     return false;
   }
 }
+
 /* -------------------------
    VIDEO LINK NORMALIZATION
 -------------------------- */
 
-function detectSourceType(url) {
-  if (url.includes("drive.google.com")) {
-    return "gdrive";
-  }
-  if (url.includes("dropbox.com")) {
-    return "dropbox";
-  }
-  return "direct";
-}
-
-
-function transformGoogleDrive(url) {
-  const match = url.match(/\/d\/(.*?)\//);
-  if (!match) return url;
-
-  const fileId = match[1];
-  return `https://drive.google.com/uc?export=download&id=${fileId}`;
-}
-
-function transformDropbox(url) {
-  return url.replace("?dl=0", "?dl=1");
-}
-
 function extractGoogleDriveId(url) {
-  // Handles:
-  // /file/d/FILE_ID/view
-  // open?id=FILE_ID
+  // Handles /file/d/FILE_ID/view and open?id=FILE_ID
   const fileMatch = url.match(/\/file\/d\/([^/]+)/);
   if (fileMatch) return fileMatch[1];
-
   const openMatch = url.match(/[?&]id=([^&]+)/);
   if (openMatch) return openMatch[1];
-
   return null;
 }
 
+function transformDropbox(url) {
+  // Convert Dropbox share link to direct download
+  return url
+    .replace("?dl=0", "?dl=1")
+    .replace("www.dropbox.com", "dl.dropboxusercontent.com");
+}
+
 async function normalizeVideoInput(url) {
-  // 🚫 Block YouTube
+  // Block YouTube
   if (url.includes("youtube.com") || url.includes("youtu.be")) {
     throw new Error(
       "YouTube links are not supported. Please upload a direct video file."
     );
   }
 
-  // ✅ Google Drive conversion
+  // Google Drive: convert share URL to direct download
   if (url.includes("drive.google.com")) {
     const fileId = extractGoogleDriveId(url);
-
-    if (!fileId) {
-      throw new Error("Invalid Google Drive link format.");
-    }
-
+    if (!fileId) throw new Error("Invalid Google Drive link format.");
     url = `https://drive.google.com/uc?export=download&id=${fileId}`;
   }
 
-  const response = await fetch(url);
+  // Dropbox: convert share URL to direct download
+  if (url.includes("dropbox.com")) {
+    url = transformDropbox(url);
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30000);
+
+  let response;
+  try {
+    response = await fetch(url, { signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
 
   if (!response.ok) {
     throw new Error("Download failed. Make sure the file is public.");
@@ -233,10 +173,10 @@ async function normalizeVideoInput(url) {
 
   const contentType = response.headers.get("content-type") || "";
 
-  // 🚨 Drive large file warning page returns HTML
+  // Google Drive large file warning page returns HTML
   if (contentType.includes("text/html")) {
     throw new Error(
-      "Google Drive link is not a direct download. The file may be too large or not public."
+      "Link is not a direct download. The file may be too large or not publicly accessible."
     );
   }
 
@@ -250,55 +190,62 @@ async function normalizeVideoInput(url) {
     throw new Error("File too large (max 100MB).");
   }
 
-  const key = `source/${Date.now()}.mp4`;
+  // Infer extension from content type
+  let extension = "mp4";
+  if (contentType.includes("audio")) extension = "mp3";
+  if (contentType.includes("webm")) extension = "webm";
+  if (contentType.includes("quicktime")) extension = "mov";
 
+  const key = `source/${Date.now()}_${Math.random().toString(36).substring(7)}.${extension}`;
   return await uploadToS3(buffer, key, contentType);
 }
+
+/* -------------------------
+   VALIDATION
+-------------------------- */
+
+// Non-media extensions to reject at Phase 1 before wasting processing time
+const NON_MEDIA_EXT = /\.(txt|pdf|html|htm|jpg|jpeg|png|gif|svg|json|xml|csv|zip|doc|docx)(\?.*)?$/i;
 
 function validateRequirement(jobName, req) {
   const name = normalizeJobName(jobName);
   const r = req || {};
-
-  // IMPORTANT: your schema uses "audioURL" right now but code uses "audioUrl".
-  // Support BOTH to avoid breaking.
   const audioUrl = r.audioUrl || r.audioURL;
 
   if (name === "dubbing") {
-    if (!r.videoUrl || !isValidUrl(r.videoUrl)) return "Missing or invalid videoUrl (must be a valid http/https URL).";
-    if (!r.targetLanguage) return "Missing targetLanguage.";
-    if (!getLanguageCode(r.targetLanguage)) return "Unsupported targetLanguage. Please use one of the supported 29 languages.";
+    if (!r.videoUrl || !isValidUrl(r.videoUrl))
+      return "Missing or invalid videoUrl (must be a valid http/https URL).";
+    if (NON_MEDIA_EXT.test(r.videoUrl))
+      return "videoUrl does not appear to point to a video or audio file.";
+    if (!r.targetLanguage)
+      return "Missing targetLanguage.";
+    if (!getLanguageCode(r.targetLanguage))
+      return "Unsupported targetLanguage. Please use one of the supported 29 languages.";
     return null;
   }
 
   if (name === "multidubbing") {
-    if (!r.videoUrl || !isValidUrl(r.videoUrl)) {
+    if (!r.videoUrl || !isValidUrl(r.videoUrl))
       return "Missing or invalid videoUrl (must be a public http/https URL).";
-    }
-  
-    if (!Array.isArray(r.targetLanguages)) {
+    if (NON_MEDIA_EXT.test(r.videoUrl))
+      return "videoUrl does not appear to point to a video or audio file.";
+    if (!Array.isArray(r.targetLanguages))
       return "targetLanguages must be an array.";
-    }
-  
-    if (r.targetLanguages.length === 0 || r.targetLanguages.length > 3) {
-      return "You must provide between 1 and 3 targetLanguages.";
-    }
-  
+    if (r.targetLanguages.length === 0 || r.targetLanguages.length > 3)
+      return "You must provide between 1 and 3 targetLanguages. Maximum is 3.";
     for (const lang of r.targetLanguages) {
-      if (!getLanguageCode(lang)) {
-        return `Unsupported language: ${lang}`;
-      }
+      if (!getLanguageCode(lang)) return `Unsupported language: ${lang}`;
     }
-  
     return null;
   }
 
   if (name === "voiceover") {
-    if (!r.text || String(r.text).trim().length === 0) return "Missing text.";
-    // optional guardrail
-    if (String(r.text).length > 5000) return "Text too long (max 5000 chars).";
-    if (r.voiceStyle && !VOICE_MAP[String(r.voiceStyle).toLowerCase()]) {
+    if (!r.text || String(r.text).trim().length === 0)
+      return "Missing text.";
+    if (String(r.text).length > 5000)
+      return "Text too long (max 5000 chars).";
+    if (r.voiceStyle && !VOICE_MAP[String(r.voiceStyle).toLowerCase()])
       return `Unsupported voiceStyle. Use one of: ${Object.keys(VOICE_MAP).join(", ")}.`;
-    }
     return null;
   }
 
@@ -311,16 +258,20 @@ function validateRequirement(jobName, req) {
     const dur = parseInt(r.duration, 10);
     if (Number.isNaN(dur)) return "Invalid duration (must be a number in seconds).";
     if (dur < 3 || dur > 280) return "Duration must be between 3 and 280 seconds.";
-    if (r.lyrics && String(r.lyrics).length > 4000) return "Lyrics too long (max 4000 chars).";
+    if (r.lyrics && String(r.lyrics).length > 4000)
+      return "Lyrics too long (max 4000 chars).";
     return null;
   }
 
   if (name === "voicerecast") {
-    if (!audioUrl || !isValidUrl(audioUrl)) return "Missing or invalid audioUrl/audioURL (must be a public http/https URL).";
-    if (!r.voiceStyle) return "Missing voiceStyle.";
-    if (!VOICE_MAP[String(r.voiceStyle).toLowerCase()]) {
+    if (!audioUrl || !isValidUrl(audioUrl))
+      return "Missing or invalid audioUrl/audioURL (must be a public http/https URL).";
+    if (NON_MEDIA_EXT.test(audioUrl))
+      return "audioUrl does not appear to point to an audio file.";
+    if (!r.voiceStyle)
+      return "Missing voiceStyle.";
+    if (!VOICE_MAP[String(r.voiceStyle).toLowerCase()])
       return `Unsupported voiceStyle. Use one of: ${Object.keys(VOICE_MAP).join(", ")}.`;
-    }
     return null;
   }
 
@@ -351,25 +302,19 @@ async function processDubbing(job) {
   }
 
   try {
-    // 🚫 Block YouTube FIRST
-    if (
-      videoUrl.includes("youtube.com") ||
-      videoUrl.includes("youtu.be")
-    ) {
+    if (videoUrl.includes("youtube.com") || videoUrl.includes("youtu.be")) {
       await job.deliver({
         type: "object",
         value: {
           jobId: job.id.toString(),
           status: "failed",
-          reason:
-            "YouTube links are not supported. Please upload a direct video file.",
+          reason: "YouTube links are not supported. Please upload a direct video file.",
           dubbedFileUrl: ""
         }
       });
       return false;
     }
 
-    // ✅ Only normalize AFTER blocking
     videoUrl = await normalizeVideoInput(videoUrl);
 
     const dubRes = await fetch("https://duelsapp.vercel.app/api/dub", {
@@ -382,15 +327,12 @@ async function processDubbing(job) {
       })
     });
 
-
     const dubData = await dubRes.json();
     const dubbingId = dubData.dubbing_id;
-
     if (!dubbingId) throw new Error("No dubbing ID returned");
 
     let dubbedUrl = "";
     let subtitleUrl = "";
-
 
     for (let i = 0; i < 24; i++) {
       await new Promise(r => setTimeout(r, 10000));
@@ -398,64 +340,45 @@ async function processDubbing(job) {
       const statusRes = await fetch(
         `https://duelsapp.vercel.app/api/dub-status?id=${dubbingId}`
       );
-
-      
       const statusData = await statusRes.json();
 
       if (statusData.status === "dubbed") {
         const elevenRes = await fetch(
           `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/audio/${langCode}`,
-          {
-            headers: {
-              "xi-api-key": process.env.ELEVENLABS_API_KEY
-            }
-          }
+          { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY } }
         );
-      
         if (!elevenRes.ok) throw new Error("Failed to fetch dubbed file");
-      
+
         const buffer = Buffer.from(await elevenRes.arrayBuffer());
-        const contentType =
-          elevenRes.headers.get("content-type") || "audio/mpeg";
-      
-        // Upload audio
+        const contentType = elevenRes.headers.get("content-type") || "audio/mpeg";
+
         dubbedUrl = await uploadToS3(
           buffer,
           `dubbed/${dubbingId}_${langCode}.mp3`,
           contentType
         );
-      
-        // ✅ Fetch subtitles (SRT)
+
+        // Fetch subtitles (SRT) — soft fail, does not block delivery
         const transcriptRes = await fetch(
           `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/transcripts/${langCode}/format/srt`,
-          {
-            headers: {
-              "xi-api-key": process.env.ELEVENLABS_API_KEY
-            }
-          }
+          { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY } }
         );
-      
-        if (!transcriptRes.ok) {
-          throw new Error("Failed to fetch transcript");
+        if (transcriptRes.ok) {
+          const srtText = await transcriptRes.text();
+          subtitleUrl = await uploadToS3(
+            Buffer.from(srtText, "utf-8"),
+            `subtitles/${dubbingId}_${langCode}.srt`,
+            "application/x-subrip"
+          );
         }
-      
-        const srtText = await transcriptRes.text();
-      
-        const subtitleKey = `subtitles/${dubbingId}_${langCode}.srt`;
-      
-        subtitleUrl = await uploadToS3(
-          Buffer.from(srtText, "utf-8"),
-          subtitleKey,
-          "application/x-subrip"
-        );
-      
+
         break;
       }
 
       if (statusData.status === "failed") break;
     }
 
-    if (!dubbedUrl) throw new Error("Dubbing failed");
+    if (!dubbedUrl) throw new Error("Dubbing failed or timed out");
 
     await job.deliver({
       type: "object",
@@ -464,15 +387,12 @@ async function processDubbing(job) {
         status: "completed",
         dubbedFileUrl: dubbedUrl,
         subtitleUrl: subtitleUrl
-
       }
     });
-
     return true;
 
   } catch (err) {
     console.error("Dubbing error:", err);
-
     await job.deliver({
       type: "object",
       value: {
@@ -482,15 +402,17 @@ async function processDubbing(job) {
       }
     });
     return false;
-
   }
 }
+
+/* -------------------------
+   MULTI-DUBBING LOGIC
+-------------------------- */
 
 async function processMultiDubbing(job) {
   let { videoUrl, targetLanguages } =
     job.requirement || job.serviceRequirement || {};
 
-  // Basic validation safety
   if (!videoUrl || !Array.isArray(targetLanguages) || targetLanguages.length === 0) {
     await job.deliver({
       type: "object",
@@ -505,25 +427,19 @@ async function processMultiDubbing(job) {
   }
 
   try {
-    // 🚫 Block YouTube FIRST
-    if (
-      videoUrl.includes("youtube.com") ||
-      videoUrl.includes("youtu.be")
-    ) {
+    if (videoUrl.includes("youtube.com") || videoUrl.includes("youtu.be")) {
       await job.deliver({
         type: "object",
         value: {
           jobId: job.id.toString(),
           status: "failed",
-          reason:
-            "YouTube links are not supported. Please upload a direct video file.",
+          reason: "YouTube links are not supported. Please upload a direct video file.",
           dubbedFiles: {}
         }
       });
       return false;
     }
 
-    // ✅ Only normalize AFTER blocking
     videoUrl = await normalizeVideoInput(videoUrl);
 
     const results = {};
@@ -549,31 +465,23 @@ async function processMultiDubbing(job) {
       let dubbedUrl = "";
       let subtitleUrl = "";
 
-      // Poll status
       for (let i = 0; i < 24; i++) {
         await new Promise(r => setTimeout(r, 10000));
 
         const statusRes = await fetch(
           `https://duelsapp.vercel.app/api/dub-status?id=${dubbingId}`
         );
-
         const statusData = await statusRes.json();
 
         if (statusData.status === "dubbed") {
           const elevenRes = await fetch(
             `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/audio/${langCode}`,
-            {
-              headers: {
-                "xi-api-key": process.env.ELEVENLABS_API_KEY
-              }
-            }
+            { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY } }
           );
-
           if (!elevenRes.ok) break;
 
           const buffer = Buffer.from(await elevenRes.arrayBuffer());
-          const contentType =
-            elevenRes.headers.get("content-type") || "audio/mpeg";
+          const contentType = elevenRes.headers.get("content-type") || "audio/mpeg";
 
           dubbedUrl = await uploadToS3(
             buffer,
@@ -583,13 +491,8 @@ async function processMultiDubbing(job) {
 
           const transcriptRes = await fetch(
             `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/transcripts/${langCode}/format/srt`,
-            {
-              headers: {
-                "xi-api-key": process.env.ELEVENLABS_API_KEY
-              }
-            }
+            { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY } }
           );
-
           if (transcriptRes.ok) {
             const srtText = await transcriptRes.text();
             subtitleUrl = await uploadToS3(
@@ -606,10 +509,7 @@ async function processMultiDubbing(job) {
       }
 
       if (dubbedUrl) {
-        results[langCode] = {
-          audio: dubbedUrl,
-          subtitles: subtitleUrl
-        };
+        results[langCode] = { audio: dubbedUrl, subtitles: subtitleUrl };
       }
     }
 
@@ -634,12 +534,10 @@ async function processMultiDubbing(job) {
         dubbedFiles: results
       }
     });
-
     return true;
 
   } catch (err) {
     console.error("Multi-dubbing error:", err);
-
     await job.deliver({
       type: "object",
       value: {
@@ -649,13 +547,12 @@ async function processMultiDubbing(job) {
         dubbedFiles: {}
       }
     });
-
     return false;
   }
 }
 
 /* -------------------------
-   VOICEOVER LOGIC (UPDATED)
+   VOICEOVER LOGIC
 -------------------------- */
 
 async function processVoiceover(job) {
@@ -663,7 +560,6 @@ async function processVoiceover(job) {
     job.requirement || job.serviceRequirement || {};
 
   const voiceId = getVoiceId(voiceStyle);
-  
 
   if (!text) {
     await job.deliver({
@@ -697,7 +593,6 @@ async function processVoiceover(job) {
 
     const buffer = Buffer.from(await response.arrayBuffer());
     const key = `voiceover/${job.id}.mp3`;
-
     const url = await uploadToS3(buffer, key, "audio/mpeg");
 
     await job.deliver({
@@ -710,11 +605,8 @@ async function processVoiceover(job) {
     });
     return true;
 
-    console.log("Voiceover delivered:", url);
-
   } catch (err) {
     console.error("Voiceover error:", err);
-
     await job.deliver({
       type: "object",
       value: {
@@ -727,21 +619,19 @@ async function processVoiceover(job) {
   }
 }
 
+/* -------------------------
+   MUSIC PRODUCTION LOGIC
+-------------------------- */
+
 async function processPremiumMusic(job) {
-  const {
-    concept,
-    genre,
-    mood,
-    vocalStyle,
-    duration,
-    lyrics
-  } = job.requirement || job.serviceRequirement || {};
+  const { concept, genre, mood, vocalStyle, duration, lyrics } =
+    job.requirement || job.serviceRequirement || {};
 
   if (!concept || !genre || !mood || !vocalStyle || !duration) {
     await job.deliver({
       type: "object",
       value: {
-        jobId: job.id.toString(),
+        jobID: job.id.toString(),
         status: "failed",
         audio: ""
       }
@@ -750,7 +640,6 @@ async function processPremiumMusic(job) {
   }
 
   try {
-    // ✅ Safe duration handling (3s min, 280s max)
     const durationMs = Math.max(
       3000,
       Math.min(280000, parseInt(duration) * 1000 || 60000)
@@ -767,13 +656,7 @@ ${lyrics && lyrics.trim() !== ""
 High quality production, radio-ready mix, cinematic depth, modern sound design.
 `;
 
-    console.log("Generating music:", {
-      concept,
-      genre,
-      mood,
-      vocalStyle,
-      duration: durationMs
-    });
+    console.log("Generating music:", { concept, genre, mood, vocalStyle, duration: durationMs });
 
     const response = await fetch(
       "https://api.elevenlabs.io/v1/music?output_format=mp3_44100_128",
@@ -787,41 +670,33 @@ High quality production, radio-ready mix, cinematic depth, modern sound design.
           prompt: finalPrompt,
           music_length_ms: durationMs,
           model_id: "music_v1",
-          force_instrumental:
-            vocalStyle.toLowerCase() === "instrumental"
+          force_instrumental: vocalStyle.toLowerCase() === "instrumental"
         })
       }
     );
 
-    if (!response.ok) {
-      throw new Error("Music generation failed");
-    }
+    if (!response.ok) throw new Error("Music generation failed");
 
     const buffer = Buffer.from(await response.arrayBuffer());
-
     const key = `music/${job.id}.mp3`;
     const url = await uploadToS3(buffer, key, "audio/mpeg");
 
     await job.deliver({
       type: "object",
       value: {
-        jobId: job.id.toString(),
+        jobID: job.id.toString(),
         status: "completed",
         audio: url
       }
     });
-
     return true;
-
-    console.log("Premium music delivered:", url);
 
   } catch (err) {
     console.error("Premium music error:", err);
-
     await job.deliver({
       type: "object",
       value: {
-        jobId: job.id.toString(),
+        jobID: job.id.toString(),
         status: "failed",
         audio: ""
       }
@@ -832,20 +707,21 @@ High quality production, radio-ready mix, cinematic depth, modern sound design.
 
 /* -------------------------
    VOICE RECASTING LOGIC
+   Uses official ElevenLabs SDK with Blob
+   (replaces broken axios + form-data + Readable approach)
 -------------------------- */
 
 async function processVoiceRecast(job) {
   const req = job.requirement || job.serviceRequirement || {};
   const audioUrl = req.audioUrl || req.audioURL;
   const voiceStyle = req.voiceStyle;
-
   const voiceId = getVoiceId(voiceStyle);
 
   if (!audioUrl) {
     await job.deliver({
       type: "object",
       value: {
-        jobId: job.id.toString(),
+        jobID: job.id.toString(),
         status: "failed",
         audio: ""
       }
@@ -856,64 +732,49 @@ async function processVoiceRecast(job) {
   try {
     console.log("Voice recasting started:", { audioUrl, voiceStyle });
 
-    // Fetch source audio
     const sourceResponse = await fetch(audioUrl);
     if (!sourceResponse.ok) throw new Error("Failed to fetch source audio");
 
     const audioBuffer = Buffer.from(await sourceResponse.arrayBuffer());
 
     if (audioBuffer.length > 25 * 1024 * 1024) {
-      throw new Error("Audio file too large");
+      throw new Error("Audio file too large (max 25MB)");
     }
 
-    const formData = new FormData();
+    const audioBlob = new Blob([audioBuffer], { type: "audio/mpeg" });
 
-    formData.append("audio", Readable.from(audioBuffer), {
-      filename: "input.mp3",
-      contentType: "audio/mpeg"
+    const audioStream = await elevenlabs.speechToSpeech.convert(voiceId, {
+      audio: audioBlob,
+      modelId: "eleven_multilingual_sts_v2",
+      outputFormat: "mp3_44100_128"
     });
-    
-    formData.append("model_id", "eleven_multilingual_sts_v2");
-    
-    const elevenResponse = await axios.post(
-      `https://api.elevenlabs.io/v1/speech-to-speech/${voiceId}?output_format=mp3_44100_128`,
-      formData,
-      {
-        headers: {
-          "xi-api-key": process.env.ELEVENLABS_API_KEY,
-          ...formData.getHeaders()
-        },
-        responseType: "arraybuffer"
-      }
-    );
-    
-    const resultBuffer = Buffer.from(elevenResponse.data);
+
+    // Collect stream into buffer
+    const chunks = [];
+    for await (const chunk of audioStream) {
+      chunks.push(chunk);
+    }
+    const resultBuffer = Buffer.concat(chunks);
+
     const key = `voicerecast/${job.id}.mp3`;
     const url = await uploadToS3(resultBuffer, key, "audio/mpeg");
 
     await job.deliver({
       type: "object",
       value: {
-        jobId: job.id.toString(),
+        jobID: job.id.toString(),
         status: "completed",
         audio: url
       }
     });
     return true;
 
-    console.log("Voice recast delivered:", url);
-
   } catch (err) {
-    if (err.response) {
-      console.error("ELEVEN ERROR:", err.response.data?.toString());
-    } else {
-      console.error("Voice recast error:", err);
-    }
-  
+    console.error("Voice recast error:", err?.message || err);
     await job.deliver({
       type: "object",
       value: {
-        jobId: job.id.toString(),
+        jobID: job.id.toString(),
         status: "failed",
         audio: ""
       }
@@ -921,7 +782,6 @@ async function processVoiceRecast(job) {
     return false;
   }
 }
-
 
 /* -------------------------
    ACP MAIN
@@ -958,7 +818,7 @@ async function main() {
       }
 
       // --------------------
-      // Phase 3: Process + Deliver ONLY
+      // Phase 3: Process + Deliver
       // --------------------
       if (memoToSign.nextPhase === 3) {
         if (processedJobs.has(job.id)) return;
@@ -982,7 +842,7 @@ async function main() {
           console.error("Processing error:", err);
         }
 
-        return; // 🔥 DO NOT evaluate here
+        return;
       }
 
       // --------------------
@@ -999,7 +859,6 @@ async function main() {
             await job.evaluate(false, "Service failed");
             console.log("Escrow refunded:", job.id);
           }
-
         } catch (err) {
           console.error("Evaluation error:", err);
         }
