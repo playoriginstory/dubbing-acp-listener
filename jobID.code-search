@@ -1,0 +1,42 @@
+# Query: jobID
+# Flags: CaseSensitive
+# ContextLines: 1
+
+9 results - 1 file
+
+index.js:
+   851        value: {
+   852:         jobId: job.id.toString(),
+   853          status: "failed",
+
+   899          value: {
+   900:           jobId: job.id.toString(),
+   901            status: "failed",
+
+   915        value: {
+   916:         jobId: job.id.toString(),
+   917          status: "completed",
+
+   927        value: {
+   928:         jobId: job.id.toString(),
+   929          status: "failed",
+
+   953        value: {
+   954:         jobId: job.id.toString(),
+   955          status: "failed",
+
+   969          value: {
+   970:           jobId: job.id.toString(),
+   971            status: "failed",
+
+   984          value: {
+   985:           jobId: job.id.toString(),
+   986            status: "failed",
+
+  1013        value: {
+  1014:         jobId: job.id.toString(),
+  1015          status: "completed",
+
+  1025        value: {
+  1026:         jobId: job.id.toString(),
+  1027          status: "failed",

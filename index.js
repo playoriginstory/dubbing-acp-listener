@@ -7,6 +7,7 @@ if (process.env.YOUTUBE_COOKIES) {
   fs.writeFileSync("/tmp/youtube_cookies.txt", process.env.YOUTUBE_COOKIES);
 }
 
+
 const { default: AcpClient, AcpContractClientV2 } = pkg;
 
 /* -------------------------
@@ -84,11 +85,11 @@ function getVoiceId(style) {
 
 /* -------------------------
    CONCURRENCY QUEUE
-   FIX #2: Increased to 6 so evaluator's simultaneous
+   FIX #2: Increased to 18 so evaluator's simultaneous
    jobs don't queue up and expire before starting.
 -------------------------- */
 
-const MAX_CONCURRENT_JOBS = 6;
+const MAX_CONCURRENT_JOBS = 30;
 let activeJobCount = 0;
 const jobQueue = [];
 const processedJobs = new Set();
@@ -508,9 +509,9 @@ async function processDubbing(job) {
     let dubbedUrl = "";
     let subtitleUrl = "";
 
-    // FIX #1: 12 × 5s = 60s max (was 24 × 10s = 240s)
-    for (let i = 0; i < 12; i++) {
-      await new Promise(r => setTimeout(r, 5000));
+    // FIX #1: 6 x 3s
+    for (let i = 0; i < 6; i++) {
+      await new Promise(r => setTimeout(r, 3000));
 
       const statusRes = await fetch(
         `https://duelsapp.vercel.app/api/dub-status?id=${dubbingId}`
@@ -646,75 +647,91 @@ async function processMultiDubbing(job) {
 
     const results = {};
 
-    for (const lang of targetLanguages) {
-      const langCode = getLanguageCode(lang);
-      if (!langCode) continue;
-
-      const dubRes = await fetch("https://duelsapp.vercel.app/api/dub", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          videoUrl,
-          target_lang: langCode,
-          source_lang: "auto"
-        })
-      });
-
-      const dubData = await dubRes.json();
-      const dubbingId = dubData.dubbing_id;
-      if (!dubbingId) continue;
-
-      let dubbedUrl = "";
-      let subtitleUrl = "";
-
-      // FIX #1: 12 × 5s = 60s max per language
-      for (let i = 0; i < 12; i++) {
-        await new Promise(r => setTimeout(r, 5000));
-
-        const statusRes = await fetch(
-          `https://duelsapp.vercel.app/api/dub-status?id=${dubbingId}`
-        );
-        const statusData = await statusRes.json();
-
-        if (statusData.status === "dubbed") {
-          const elevenRes = await fetch(
-            `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/audio/${langCode}`,
-            { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY } }
+    await Promise.all(
+      targetLanguages.map(async (lang) => {
+    
+        const langCode = getLanguageCode(lang);
+        if (!langCode) return;
+    
+        const dubRes = await fetch("https://duelsapp.vercel.app/api/dub", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            videoUrl,
+            target_lang: langCode,
+            source_lang: "auto"
+          })
+        });
+    
+        const dubData = await dubRes.json();
+        const dubbingId = dubData.dubbing_id;
+        if (!dubbingId) return;
+    
+        let dubbedUrl = "";
+        let subtitleUrl = "";
+    
+        for (let i = 0; i < 12; i++) {
+          await new Promise(r => setTimeout(r, 5000));
+    
+          const statusRes = await fetch(
+            `https://duelsapp.vercel.app/api/dub-status?id=${dubbingId}`
           );
-          if (!elevenRes.ok) break;
-
-          const buffer = Buffer.from(await elevenRes.arrayBuffer());
-          const contentType = elevenRes.headers.get("content-type") || "audio/mpeg";
-
-          dubbedUrl = await uploadToS3(
-            buffer,
-            `multidub/${dubbingId}_${langCode}.mp3`,
-            contentType
-          );
-
-          const transcriptRes = await fetch(
-            `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/transcripts/${langCode}/format/srt`,
-            { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY } }
-          );
-          if (transcriptRes.ok) {
-            const srtText = await transcriptRes.text();
-            subtitleUrl = await uploadToS3(
-              Buffer.from(srtText, "utf-8"),
-              `subtitles/${dubbingId}_${langCode}.srt`,
-              "application/x-subrip"
+    
+          const statusData = await statusRes.json();
+    
+          if (statusData.status === "dubbed") {
+    
+            const elevenRes = await fetch(
+              `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/audio/${langCode}`,
+              { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY } }
             );
+    
+            if (!elevenRes.ok) return;
+    
+            const buffer = Buffer.from(await elevenRes.arrayBuffer());
+            const contentType =
+              elevenRes.headers.get("content-type") || "audio/mpeg";
+    
+            dubbedUrl = await uploadToS3(
+              buffer,
+              `multidub/${dubbingId}_${langCode}.mp3`,
+              contentType
+            );
+    
+            const transcriptRes = await fetch(
+              `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/transcripts/${langCode}/format/srt`,
+              {
+                headers: {
+                  "xi-api-key": process.env.ELEVENLABS_API_KEY
+                }
+              }
+            );
+    
+            if (transcriptRes.ok) {
+              const srtText = await transcriptRes.text();
+    
+              subtitleUrl = await uploadToS3(
+                Buffer.from(srtText, "utf-8"),
+                `subtitles/${dubbingId}_${langCode}.srt`,
+                "application/x-subrip"
+              );
+            }
+    
+            break;
           }
-
-          break;
+    
+          if (statusData.status === "failed") break;
         }
-
-        if (statusData.status === "failed") break;
-      }
-
-      if (dubbedUrl) {
-        results[langCode] = { audio: dubbedUrl, subtitles: subtitleUrl };
-      }
-    }
+    
+        if (dubbedUrl) {
+          results[langCode] = {
+            audio: dubbedUrl,
+            subtitles: subtitleUrl
+          };
+        }
+    
+      })
+    );
 
     // FIX #5: Always deliver, never throw
     if (Object.keys(results).length === 0) {
@@ -849,7 +866,7 @@ async function processPremiumMusic(job) {
     await job.deliver({
       type: "object",
       value: {
-        jobID: job.id.toString(),
+        jobId: job.id.toString(),
         status: "failed",
         audio: ""
       }
@@ -897,7 +914,7 @@ High quality production, radio-ready mix, cinematic depth, modern sound design.
       await job.deliver({
         type: "object",
         value: {
-          jobID: job.id.toString(),
+          jobId: job.id.toString(),
           status: "failed",
           reason: `ElevenLabs music API returned ${response.status}`,
           audio: ""
@@ -913,7 +930,7 @@ High quality production, radio-ready mix, cinematic depth, modern sound design.
     await job.deliver({
       type: "object",
       value: {
-        jobID: job.id.toString(),
+        jobId: job.id.toString(),
         status: "completed",
         audio: url
       }
@@ -925,7 +942,7 @@ High quality production, radio-ready mix, cinematic depth, modern sound design.
     await job.deliver({
       type: "object",
       value: {
-        jobID: job.id.toString(),
+        jobId: job.id.toString(),
         status: "failed",
         reason: err.message || "Unexpected error during music production",
         audio: ""
@@ -951,7 +968,7 @@ async function processVoiceRecast(job) {
     await job.deliver({
       type: "object",
       value: {
-        jobID: job.id.toString(),
+        jobId: job.id.toString(),
         status: "failed",
         audio: ""
       }
@@ -967,7 +984,7 @@ async function processVoiceRecast(job) {
       await job.deliver({
         type: "object",
         value: {
-          jobID: job.id.toString(),
+          jobId: job.id.toString(),
           status: "failed",
           reason: "Failed to fetch source audio — make sure URL is publicly accessible",
           audio: ""
@@ -982,7 +999,7 @@ async function processVoiceRecast(job) {
       await job.deliver({
         type: "object",
         value: {
-          jobID: job.id.toString(),
+          jobId: job.id.toString(),
           status: "failed",
           reason: "Audio file too large (max 25MB)",
           audio: ""
@@ -1011,7 +1028,7 @@ async function processVoiceRecast(job) {
     await job.deliver({
       type: "object",
       value: {
-        jobID: job.id.toString(),
+        jobId: job.id.toString(),
         status: "completed",
         audio: url
       }
@@ -1023,7 +1040,7 @@ async function processVoiceRecast(job) {
     await job.deliver({
       type: "object",
       value: {
-        jobID: job.id.toString(),
+        jobId: job.id.toString(),
         status: "failed",
         reason: err.message || "Unexpected error during voice recast",
         audio: ""
@@ -1048,7 +1065,10 @@ async function main() {
     acpContractClient,
 
     onNewTask: async (job, memoToSign) => {
+
       if (!memoToSign) return;
+
+      console.log("Phase:", memoToSign.nextPhase, "Job:", job.id, job.name);
 
       // --------------------
       // Phase 1: Accept / Reject
@@ -1070,15 +1090,15 @@ async function main() {
 
       // --------------------
       // Phase 3: Process + Deliver
-      // FIX #2: MAX_CONCURRENT_JOBS = 6 so evaluator jobs
+      // FIX #2: MAX_CONCURRENT_JOBS =  so evaluator jobs
       // don't queue up and expire before starting.
       // FIX #3: Fail-safe wrapper ensures delivery even on crash.
       // --------------------
       if (memoToSign.nextPhase === 3) {
         if (processedJobs.has(job.id)) return;
-        processedJobs.add(job.id);
+        processedJobs.add(job.id.toString());
 
-        enqueueJob(async () => {
+        await enqueueJob(async () => {
           let delivered = false;
 
           try {
