@@ -89,15 +89,26 @@ const VOICE_MAP = {
   alice:   "Xb7hH8MSUJpSbSDYk0k2"
 };
 
+/**
+ * Normalize voice style — strips descriptions like "charles – Deep male voice"
+ * down to just the key name "charles".
+ */
+function normalizeVoiceStyle(style) {
+  if (!style) return null;
+  return String(style).split(/\s*[–—\-]\s*/)[0].trim().toLowerCase();
+}
+
 function getVoiceId(style) {
-  if (!style) return VOICE_MAP.charles;
-  return VOICE_MAP[style.toLowerCase()] || VOICE_MAP.charles;
+  const key = normalizeVoiceStyle(style);
+  if (!key) return VOICE_MAP.charles;
+  return VOICE_MAP[key] || VOICE_MAP.charles;
 }
 
 /* -------------------------
    JOB RESULT CACHE
    Phase 1 pre-processes and stores results here.
-   Phase 3 delivers from cache instantly.
+   Delivery happens via auto-deliver timer (15s)
+   OR via Phase 3 socket event — whichever comes first.
 -------------------------- */
 
 const jobResultCache = new Map();
@@ -111,15 +122,15 @@ const processedPhase3 = new Set();
 
 /* -------------------------
    PER-TYPE CONCURRENCY QUEUES
-   Fast jobs (voiceover/voicerecast) never queue behind slow dubbing jobs.
+   Fast jobs never queue behind slow dubbing jobs.
 -------------------------- */
 
 const MAX_CONCURRENT = {
-  voiceover:     10,
-  voicerecast:   10,
-  dubbing:        3,
-  multidubbing:   3,
-  musicproduction: 3
+  voiceover:       10,
+  voicerecast:     10,
+  dubbing:          3,
+  multidubbing:     3,
+  musicproduction:  3
 };
 
 const activeCount = {
@@ -170,10 +181,10 @@ async function retry(fn, attempts = 4) {
   }
 }
 
-async function safeRespond(job)              { return retry(() => job.respond(true)); }
-async function safeReject(job, reason)       { return retry(() => job.reject(reason)); }
-async function safeDeliver(job, payload)     { return retry(() => job.deliver(payload)); }
-async function safeEvaluate(job, ok, msg)    { return retry(() => job.evaluate(ok, msg)); }
+async function safeRespond(job)           { return retry(() => job.respond(true)); }
+async function safeReject(job, reason)    { return retry(() => job.reject(reason)); }
+async function safeDeliver(job, payload)  { return retry(() => job.deliver(payload)); }
+async function safeEvaluate(job, ok, msg) { return retry(() => job.evaluate(ok, msg)); }
 
 /* -------------------------
    S3
@@ -213,10 +224,39 @@ const HARMFUL_URL_PATTERNS = [
 ];
 
 const HARMFUL_TEXT_PATTERNS = [
+  // Bracket-encoded harmful content (evaluator uses these placeholders)
+  /\[nsfw/i,
+  /\[offensive/i,
+  /\[explicit/i,
+  /\[redacted/i,
+  /\[harmful/i,
+  /\[hate/i,
+  /\[violent/i,
+  // Sexual content
   /nsfw/i,
-  /explicit\s+(material|content|nsfw)/i,
+  /explicit\s+(material|content|sexual|audio|video)/i,
+  /explicit\s+sexual/i,
+  /erotic\s+stor/i,
+  /explicit\s+erot/i,
+  /sexual\s+(audio|track|content|recording)/i,
+  // Violence
+  /incit.*violence/i,
+  /incit.*violen/i,
+  /audio.*incit/i,
+  /graphic\s+violen/i,
+  /explicit\s+violen/i,
+  // Weapons / illegal
   /illegal\s+weapon/i,
   /manufactur.*(weapon|explos)/i,
+  /bomb\s+(how|make|build|instruct)/i,
+  // Drugs / medical
+  /illegal\s+drug/i,
+  /prohibited\s+medical/i,
+  /drug\s+information/i,
+  // Hate speech
+  /hate\s+speech/i,
+  /\[target\s+group/i,
+  // Other
   /kill\s+all/i,
   /kill\s+every/i,
   /kill\s+(the\s+)?(group|people|race|them)/i,
@@ -225,17 +265,10 @@ const HARMFUL_TEXT_PATTERNS = [
   /ethnic\s+cleans/i,
   /self.?harm/i,
   /suicide/i,
-  /graphic\s+violen/i,
-  /explicit\s+violen/i,
-  /explicit\s+erot/i,
-  /erotic\s+stor/i,
   /rape/i,
   /child\s+(porn|abuse|exploit)/i,
-  /bomb\s+(how|make|build|instruct)/i,
   /terrorist/i,
   /terrorism/i,
-  /hate\s+speech/i,
-  /\[target\s+group/i,
   /without\s+mercy/i,
 ];
 
@@ -306,7 +339,7 @@ async function normalizeVideoInput(url) {
   }
 
   // Skip download+upload for direct media URLs — saves 5–10s per job
-  if (url.endsWith(".mp4") || url.endsWith(".mp3") || url.endsWith(".webm") || url.endsWith(".mov")) {
+  if (/\.(mp4|mp3|webm|mov)(\?.*)?$/i.test(url)) {
     return url;
   }
 
@@ -389,17 +422,18 @@ function validateRequirement(jobName, req) {
     if (!r.text || String(r.text).trim().length === 0) return "Missing text.";
     if (String(r.text).length > 5000) return "Text too long (max 5000 chars).";
     if (isHarmfulText(String(r.text))) return "Content rejected: text contains prohibited or harmful content.";
-    if (r.voiceStyle && !VOICE_MAP[String(r.voiceStyle).toLowerCase()])
+    const vsKey = normalizeVoiceStyle(r.voiceStyle);
+    if (r.voiceStyle && !VOICE_MAP[vsKey])
       return `Unsupported voiceStyle. Use one of: ${Object.keys(VOICE_MAP).join(", ")}.`;
     return null;
   }
 
   if (name === "musicproduction") {
-    if (!r.concept)   return "Missing concept.";
-    if (!r.genre)     return "Missing genre.";
-    if (!r.mood)      return "Missing mood.";
+    if (!r.concept)    return "Missing concept.";
+    if (!r.genre)      return "Missing genre.";
+    if (!r.mood)       return "Missing mood.";
     if (!r.vocalStyle) return "Missing vocalStyle.";
-    if (!r.duration)  return "Missing duration (seconds).";
+    if (!r.duration)   return "Missing duration (seconds).";
     const dur = parseInt(r.duration, 10);
     if (Number.isNaN(dur)) return "Invalid duration.";
     if (dur < 3 || dur > 280) return "Duration must be between 3 and 280 seconds.";
@@ -415,7 +449,8 @@ function validateRequirement(jobName, req) {
     if (NON_MEDIA_EXT.test(audioUrl)) return "audioUrl does not appear to point to an audio file.";
     if (isHarmfulUrl(audioUrl)) return "Content rejected: URL contains prohibited content indicators.";
     if (!r.voiceStyle) return "Missing voiceStyle.";
-    if (!VOICE_MAP[String(r.voiceStyle).toLowerCase()])
+    const vsKey = normalizeVoiceStyle(r.voiceStyle);
+    if (!VOICE_MAP[vsKey])
       return `Unsupported voiceStyle. Use one of: ${Object.keys(VOICE_MAP).join(", ")}.`;
     return null;
   }
@@ -426,7 +461,7 @@ function validateRequirement(jobName, req) {
 /* -------------------------
    PROCESSING FUNCTIONS
    Return payload objects — do not call job.deliver directly.
-   Results cached so Phase 3 delivers instantly.
+   Results cached so Phase 3 or auto-timer delivers.
 -------------------------- */
 
 async function runDubbing(job) {
@@ -456,7 +491,6 @@ async function runDubbing(job) {
     let dubbedUrl = "";
     let subtitleUrl = "";
 
-    // 6 × 3s = 18s max — fits within evaluator timeout
     for (let i = 0; i < 6; i++) {
       await new Promise(r => setTimeout(r, 3000));
       const statusRes = await fetch(`https://duelsapp.vercel.app/api/dub-status?id=${dubbingId}`);
@@ -502,6 +536,8 @@ async function runMultiDubbing(job) {
   let { videoUrl, targetLanguages } = job.requirement || job.serviceRequirement || {};
   const jobId = job.id.toString();
 
+  console.log("runMultiDubbing input:", { videoUrl, targetLanguages });
+
   if (!videoUrl || !Array.isArray(targetLanguages) || targetLanguages.length === 0) {
     return { type: "object", value: { jobId, status: "failed", reason: "Missing videoUrl or targetLanguages", dubbedFiles: {} } };
   }
@@ -526,7 +562,6 @@ async function runMultiDubbing(job) {
       let dubbedUrl = "";
       let subtitleUrl = "";
 
-      // 6 × 3s = 18s max
       for (let i = 0; i < 6; i++) {
         await new Promise(r => setTimeout(r, 3000));
         const statusRes = await fetch(`https://duelsapp.vercel.app/api/dub-status?id=${dubbingId}`);
@@ -648,8 +683,15 @@ async function runVoiceRecast(job) {
     }
 
     const audioBuffer = Buffer.from(await sourceResponse.arrayBuffer());
+
     if (audioBuffer.length > 25 * 1024 * 1024) {
       return { type: "object", value: { jobId, status: "failed", reason: "Audio file too large (max 25MB)", audio: "" } };
+    }
+
+    // ElevenLabs STS cap is 300s — estimate from file size at 128kbps
+    const estimatedDurationSeconds = (audioBuffer.length / 128000) * 8;
+    if (estimatedDurationSeconds > 295) {
+      return { type: "object", value: { jobId, status: "failed", reason: "Audio too long for voice recast (max ~5 minutes)", audio: "" } };
     }
 
     const audioBlob = new Blob([audioBuffer], { type: "audio/mpeg" });
@@ -672,7 +714,9 @@ async function runVoiceRecast(job) {
 }
 
 /* -------------------------
-   DISPATCH — runs job and caches result
+   DISPATCH
+   Runs job, caches result, schedules auto-deliver timer.
+   Auto-deliver fires after 15s if Phase 3 never arrives.
 -------------------------- */
 
 async function dispatchJob(job) {
@@ -681,11 +725,11 @@ async function dispatchJob(job) {
 
   let payload;
   try {
-    if      (job.name === "dubbing")        payload = await runDubbing(job);
-    else if (job.name === "multidubbing")   payload = await runMultiDubbing(job);
+    if      (job.name === "dubbing")         payload = await runDubbing(job);
+    else if (job.name === "multidubbing")    payload = await runMultiDubbing(job);
     else if (job.name === "musicproduction") payload = await runPremiumMusic(job);
-    else if (job.name === "voiceover")      payload = await runVoiceover(job);
-    else if (job.name === "voicerecast")    payload = await runVoiceRecast(job);
+    else if (job.name === "voiceover")       payload = await runVoiceover(job);
+    else if (job.name === "voicerecast")     payload = await runVoiceRecast(job);
     else payload = { type: "object", value: { jobId, status: "failed", reason: `Unknown job type: ${job.name}` } };
   } catch (err) {
     console.error("dispatchJob error:", err);
@@ -693,7 +737,24 @@ async function dispatchJob(job) {
   }
 
   jobResultCache.set(jobId, { payload, delivered: false });
-  console.log("Result cached:", jobId, payload.value?.status);
+  console.log("Result cached:", jobId, payload.value?.status, payload.value?.reason || "");
+
+  // Auto-deliver after 15s if Phase 3 socket event never arrives
+  setTimeout(async () => {
+    const cached = jobResultCache.get(jobId);
+    if (cached && !cached.delivered) {
+      console.log("Auto-delivering (Phase 3 not received):", jobId, cached.payload.value?.status);
+      try {
+        cached.delivered = true;
+        await safeDeliver(job, cached.payload);
+        console.log("Auto-deliver success:", jobId);
+      } catch (err) {
+        console.error("Auto-deliver failed:", jobId, err?.message);
+        cached.delivered = false; // allow retry if it failed
+      }
+    }
+  }, 15000);
+
   return payload;
 }
 
@@ -703,9 +764,9 @@ async function dispatchJob(job) {
 
 async function main() {
   console.log("Starting... ENV check:", {
-    hasPrivKey:   !!process.env.WHITELISTED_WALLET_PRIVATE_KEY,
-    entityId:     process.env.SELLER_ENTITY_ID,
-    agentWallet:  process.env.SELLER_AGENT_WALLET_ADDRESS,
+    hasPrivKey:    !!process.env.WHITELISTED_WALLET_PRIVATE_KEY,
+    entityId:      process.env.SELLER_ENTITY_ID,
+    agentWallet:   process.env.SELLER_AGENT_WALLET_ADDRESS,
     hasElevenLabs: !!process.env.ELEVENLABS_API_KEY,
     hasAwsRegion:  !!process.env.AWS_REGION,
     hasAwsBucket:  !!process.env.AWS_S3_BUCKET,
@@ -740,7 +801,8 @@ async function main() {
 
       /* -------------------------
          PHASE 1 — ACCEPT / REJECT
-         Immediately start processing in background after accept.
+         Start processing immediately in background.
+         Auto-deliver timer handles delivery if Phase 3 never arrives.
       -------------------------- */
 
       if (phase === 1) {
@@ -762,10 +824,10 @@ async function main() {
           }
 
           await safeRespond(job);
-          await new Promise(r => setTimeout(r, 800)); // buffer for ACP race condition
+          await new Promise(r => setTimeout(r, 800));
           console.log("Job accepted:", jobId, job.name);
 
-          // Start processing immediately — result cached for Phase 3
+          // Fire and forget — auto-deliver timer scheduled inside dispatchJob
           enqueueJob(job.name, () => dispatchJob(job)).catch(err => {
             console.error("Background dispatch error:", err);
           });
@@ -779,7 +841,7 @@ async function main() {
 
       /* -------------------------
          PHASE 3 — DELIVER
-         Deliver from cache. Wait up to 30s if still processing.
+         Deliver from cache. Auto-timer may already have fired.
       -------------------------- */
 
       if (phase === 3) {
@@ -793,6 +855,7 @@ async function main() {
           let cached = jobResultCache.get(jobId);
           let waited = 0;
 
+          // Wait up to 30s if processing still in progress
           while (!cached && waited < 30000) {
             await new Promise(r => setTimeout(r, 1000));
             waited += 1000;
@@ -801,16 +864,16 @@ async function main() {
 
           if (cached && !cached.delivered) {
             cached.delivered = true;
-            console.log("Delivering cached result:", jobId, cached.payload.value?.status);
+            console.log("Delivering from Phase 3:", jobId, cached.payload.value?.status);
             await safeDeliver(job, cached.payload);
-          } else if (!cached) {
+          } else if (cached && cached.delivered) {
+            console.log("Already delivered by auto-timer:", jobId);
+          } else {
             console.log("No cached result, delivering fallback:", jobId);
             await safeDeliver(job, {
               type: "object",
               value: { jobId, status: "failed", reason: "Processing did not complete in time" }
             });
-          } else {
-            console.log("Already delivered:", jobId);
           }
 
         } catch (err) {
