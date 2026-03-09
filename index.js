@@ -1084,6 +1084,7 @@ async function main() {
         }
 
         await job.respond(true);
+        await new Promise(r => setTimeout(r, 50));
         console.log("Job accepted:", job.id, job.name);
         return;
       }
