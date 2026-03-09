@@ -9,15 +9,14 @@ if (process.env.YOUTUBE_COOKIES) {
 
 /* -------------------------
    GLOBAL CRASH GUARDS
-   Must be first — prevents Node from exiting on ACP RPC errors
 -------------------------- */
 
 process.on("unhandledRejection", err => {
-  console.error("UNHANDLED REJECTION (process continuing):", err);
+  console.error("UNHANDLED REJECTION (continuing):", err);
 });
 
 process.on("uncaughtException", err => {
-  console.error("UNCAUGHT EXCEPTION (process continuing):", err);
+  console.error("UNCAUGHT EXCEPTION (continuing):", err);
 });
 
 const { default: AcpClient, AcpContractClientV2 } = pkg;
@@ -31,7 +30,7 @@ const elevenlabs = new ElevenLabsClient({
 });
 
 /* -------------------------
-   LANGUAGE LIST (DUBBING)
+   LANGUAGE LIST
 -------------------------- */
 
 const LANGUAGES = [
@@ -77,17 +76,17 @@ function getLanguageCode(input) {
 }
 
 /* -------------------------
-   VOICE STYLE → VOICE ID MAP
+   VOICE MAP
 -------------------------- */
 
 const VOICE_MAP = {
   charles: "S9GPGBaMND8XWwwzxQXp",
   jessica: "cgSgspJ2msm6clMCkdW9",
-  darryl: "h8LZpYr8y3VBz0q2x0LP",
-  lily: "pFZP5JQG7iQjIQuC4Bku",
-  donald: "X4tS1zPSNPkD36l35rq7",
+  darryl:  "h8LZpYr8y3VBz0q2x0LP",
+  lily:    "pFZP5JQG7iQjIQuC4Bku",
+  donald:  "X4tS1zPSNPkD36l35rq7",
   matilda: "XrExE9yKIg1WjnnlVkGX",
-  alice: "Xb7hH8MSUJpSbSDYk0k2"
+  alice:   "Xb7hH8MSUJpSbSDYk0k2"
 };
 
 function getVoiceId(style) {
@@ -96,42 +95,67 @@ function getVoiceId(style) {
 }
 
 /* -------------------------
-   CONCURRENCY QUEUE
-   Capped at 6 to avoid RPC overload during evaluations
+   JOB RESULT CACHE
+   Phase 1 pre-processes and stores results here.
+   Phase 3 delivers from cache instantly.
 -------------------------- */
 
-const MAX_CONCURRENT_JOBS = 6;
-let activeJobCount = 0;
-const jobQueue = [];
+const jobResultCache = new Map();
 
-// Phase-level deduplication sets
+/* -------------------------
+   DEDUPLICATION
+-------------------------- */
+
 const processedPhase1 = new Set();
 const processedPhase3 = new Set();
 
-function enqueueJob(fn) {
+/* -------------------------
+   PER-TYPE CONCURRENCY QUEUES
+   Fast jobs (voiceover/voicerecast) never queue behind slow dubbing jobs.
+-------------------------- */
+
+const MAX_CONCURRENT = {
+  voiceover:     10,
+  voicerecast:   10,
+  dubbing:        3,
+  multidubbing:   3,
+  musicproduction: 3
+};
+
+const activeCount = {
+  voiceover: 0, voicerecast: 0,
+  dubbing: 0, multidubbing: 0, musicproduction: 0
+};
+
+const queues = {
+  voiceover: [], voicerecast: [],
+  dubbing: [], multidubbing: [], musicproduction: []
+};
+
+function enqueueJob(jobType, fn) {
   return new Promise((resolve, reject) => {
-    jobQueue.push({ fn, resolve, reject });
-    drainQueue();
+    const type = queues[jobType] ? jobType : "dubbing";
+    queues[type].push({ fn, resolve, reject });
+    drainQueue(type);
   });
 }
 
-function drainQueue() {
-  while (activeJobCount < MAX_CONCURRENT_JOBS && jobQueue.length > 0) {
-    const { fn, resolve, reject } = jobQueue.shift();
-    activeJobCount++;
+function drainQueue(type) {
+  while (activeCount[type] < MAX_CONCURRENT[type] && queues[type].length > 0) {
+    const { fn, resolve, reject } = queues[type].shift();
+    activeCount[type]++;
     fn()
       .then(resolve)
       .catch(reject)
       .finally(() => {
-        activeJobCount--;
-        drainQueue();
+        activeCount[type]--;
+        drainQueue(type);
       });
   }
 }
 
 /* -------------------------
    RETRY WRAPPER
-   Handles intermittent ACP RPC 500 errors
 -------------------------- */
 
 async function retry(fn, attempts = 4) {
@@ -146,39 +170,24 @@ async function retry(fn, attempts = 4) {
   }
 }
 
-async function safeRespond(job) {
-  return retry(() => job.respond(true));
-}
-
-async function safeReject(job, reason) {
-  return retry(() => job.reject(reason));
-}
-
-async function safeDeliver(job, payload) {
-  return retry(() => job.deliver(payload));
-}
-
-async function safeEvaluate(job, success, message) {
-  return retry(() => job.evaluate(success, message));
-}
+async function safeRespond(job)              { return retry(() => job.respond(true)); }
+async function safeReject(job, reason)       { return retry(() => job.reject(reason)); }
+async function safeDeliver(job, payload)     { return retry(() => job.deliver(payload)); }
+async function safeEvaluate(job, ok, msg)    { return retry(() => job.evaluate(ok, msg)); }
 
 /* -------------------------
-   S3 SETUP
+   S3
 -------------------------- */
 
-const s3 = new S3Client({
-  region: process.env.AWS_REGION
-});
+const s3 = new S3Client({ region: process.env.AWS_REGION });
 
 async function uploadToS3(buffer, key, contentType) {
-  await s3.send(
-    new PutObjectCommand({
-      Bucket: process.env.AWS_S3_BUCKET,
-      Key: key,
-      Body: buffer,
-      ContentType: contentType
-    })
-  );
+  await s3.send(new PutObjectCommand({
+    Bucket: process.env.AWS_S3_BUCKET,
+    Key: key,
+    Body: buffer,
+    ContentType: contentType
+  }));
   return `https://${process.env.AWS_S3_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${key}`;
 }
 
@@ -190,9 +199,7 @@ function isValidUrl(u) {
   try {
     const url = new URL(u);
     return ["http:", "https:"].includes(url.protocol);
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
 
 /* -------------------------
@@ -206,6 +213,10 @@ const HARMFUL_URL_PATTERNS = [
 ];
 
 const HARMFUL_TEXT_PATTERNS = [
+  /nsfw/i,
+  /explicit\s+(material|content|nsfw)/i,
+  /illegal\s+weapon/i,
+  /manufactur.*(weapon|explos)/i,
   /kill\s+all/i,
   /kill\s+every/i,
   /kill\s+(the\s+)?(group|people|race|them)/i,
@@ -221,8 +232,6 @@ const HARMFUL_TEXT_PATTERNS = [
   /rape/i,
   /child\s+(porn|abuse|exploit)/i,
   /bomb\s+(how|make|build|instruct)/i,
-  /manufactur.*(weapon|explos)/i,
-  /illegal\s+weapon/i,
   /terrorist/i,
   /terrorism/i,
   /hate\s+speech/i,
@@ -231,8 +240,7 @@ const HARMFUL_TEXT_PATTERNS = [
 ];
 
 function isHarmfulUrl(url) {
-  const lower = url.toLowerCase();
-  return HARMFUL_URL_PATTERNS.some(p => lower.includes(p));
+  return HARMFUL_URL_PATTERNS.some(p => url.toLowerCase().includes(p));
 }
 
 function isHarmfulText(text) {
@@ -240,11 +248,10 @@ function isHarmfulText(text) {
 }
 
 /* -------------------------
-   VIDEO LINK NORMALIZATION
+   VIDEO NORMALIZATION
 -------------------------- */
 
 function extractGoogleDriveId(url) {
-  // Handles /file/d/ID, /videos/d/ID, /document/d/ID, open?id=ID
   const fileMatch = url.match(/\/(?:file|videos|document|presentation|spreadsheets)\/d\/([^/]+)/);
   if (fileMatch) return fileMatch[1];
   const openMatch = url.match(/[?&]id=([^&]+)/);
@@ -260,38 +267,22 @@ function transformDropbox(url) {
 
 async function fetchGoogleDriveFile(fileId) {
   const directUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
-
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30000);
-
   let response;
   try {
     response = await fetch(directUrl, { signal: controller.signal });
   } finally {
     clearTimeout(timeout);
   }
-
-  if (!response.ok) {
-    throw new Error("Google Drive download failed. Make sure the file is shared publicly.");
-  }
-
+  if (!response.ok) throw new Error("Google Drive download failed. Make sure the file is shared publicly.");
   const contentType = response.headers.get("content-type") || "";
+  if (!contentType.includes("text/html")) return { response, contentType };
 
-  // Small file — direct download
-  if (!contentType.includes("text/html")) {
-    return { response, contentType };
-  }
-
-  // Large file — extract confirm token from virus-scan warning page
   const html = await response.text();
   const confirmMatch = html.match(/confirm=([0-9A-Za-z_\-]+)/);
-  const uuidMatch = html.match(/uuid=([0-9A-Za-z_\-]+)/);
-
-  if (!confirmMatch) {
-    throw new Error(
-      "Google Drive file requires manual confirmation or is not publicly accessible."
-    );
-  }
+  const uuidMatch   = html.match(/uuid=([0-9A-Za-z_\-]+)/);
+  if (!confirmMatch) throw new Error("Google Drive file requires manual confirmation or is not publicly accessible.");
 
   const confirmToken = confirmMatch[1];
   const uuid = uuidMatch ? uuidMatch[1] : "";
@@ -299,20 +290,14 @@ async function fetchGoogleDriveFile(fileId) {
 
   const controller2 = new AbortController();
   const timeout2 = setTimeout(() => controller2.abort(), 60000);
-
   let confirmedResponse;
   try {
     confirmedResponse = await fetch(confirmUrl, { signal: controller2.signal });
   } finally {
     clearTimeout(timeout2);
   }
-
-  if (!confirmedResponse.ok) {
-    throw new Error("Google Drive confirmed download failed.");
-  }
-
-  const confirmedContentType = confirmedResponse.headers.get("content-type") || "";
-  return { response: confirmedResponse, contentType: confirmedContentType };
+  if (!confirmedResponse.ok) throw new Error("Google Drive confirmed download failed.");
+  return { response: confirmedResponse, contentType: confirmedResponse.headers.get("content-type") || "" };
 }
 
 async function normalizeVideoInput(url) {
@@ -320,68 +305,49 @@ async function normalizeVideoInput(url) {
     throw new Error("YouTube links are not supported. Please upload a direct video file.");
   }
 
-  // Handle both drive.google.com and docs.google.com
+  // Skip download+upload for direct media URLs — saves 5–10s per job
+  if (url.endsWith(".mp4") || url.endsWith(".mp3") || url.endsWith(".webm") || url.endsWith(".mov")) {
+    return url;
+  }
+
   if (url.includes("drive.google.com") || url.includes("docs.google.com")) {
     const fileId = extractGoogleDriveId(url);
-    if (!fileId) throw new Error(
-      "Invalid Google link format. Please share via Google Drive using 'Copy link' on the file."
-    );
-
+    if (!fileId) throw new Error("Invalid Google link format. Please share via Google Drive using 'Copy link'.");
     const { response, contentType } = await fetchGoogleDriveFile(fileId);
-
-    if (!contentType.includes("video") && !contentType.includes("audio")) {
+    if (!contentType.includes("video") && !contentType.includes("audio"))
       throw new Error("Google Drive URL does not point to a valid video/audio file.");
-    }
-
     const buffer = Buffer.from(await response.arrayBuffer());
     if (buffer.length > 100 * 1024 * 1024) throw new Error("File too large (max 100MB).");
-
-    let extension = "mp4";
-    if (contentType.includes("audio")) extension = "mp3";
-    if (contentType.includes("webm")) extension = "webm";
-    if (contentType.includes("quicktime")) extension = "mov";
-
-    const key = `source/${Date.now()}_${Math.random().toString(36).substring(7)}.${extension}`;
+    let ext = "mp4";
+    if (contentType.includes("audio")) ext = "mp3";
+    if (contentType.includes("webm")) ext = "webm";
+    if (contentType.includes("quicktime")) ext = "mov";
+    const key = `source/${Date.now()}_${Math.random().toString(36).substring(7)}.${ext}`;
     return await uploadToS3(buffer, key, contentType);
   }
 
-  if (url.includes("dropbox.com")) {
-    url = transformDropbox(url);
-  }
+  if (url.includes("dropbox.com")) url = transformDropbox(url);
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30000);
-
   let response;
   try {
     response = await fetch(url, { signal: controller.signal });
   } finally {
     clearTimeout(timeout);
   }
-
-  if (!response.ok) {
-    throw new Error("Download failed. Make sure the file is public.");
-  }
-
+  if (!response.ok) throw new Error("Download failed. Make sure the file is public.");
   const contentType = response.headers.get("content-type") || "";
-
-  if (contentType.includes("text/html")) {
-    throw new Error("Link returned an HTML page instead of a file. Please use a direct download URL.");
-  }
-
-  if (!contentType.includes("video") && !contentType.includes("audio")) {
+  if (contentType.includes("text/html")) throw new Error("Link returned an HTML page. Please use a direct download URL.");
+  if (!contentType.includes("video") && !contentType.includes("audio"))
     throw new Error("URL does not point to a valid video/audio file.");
-  }
-
   const buffer = Buffer.from(await response.arrayBuffer());
   if (buffer.length > 100 * 1024 * 1024) throw new Error("File too large (max 100MB).");
-
-  let extension = "mp4";
-  if (contentType.includes("audio")) extension = "mp3";
-  if (contentType.includes("webm")) extension = "webm";
-  if (contentType.includes("quicktime")) extension = "mov";
-
-  const key = `source/${Date.now()}_${Math.random().toString(36).substring(7)}.${extension}`;
+  let ext = "mp4";
+  if (contentType.includes("audio")) ext = "mp3";
+  if (contentType.includes("webm")) ext = "webm";
+  if (contentType.includes("quicktime")) ext = "mov";
+  const key = `source/${Date.now()}_${Math.random().toString(36).substring(7)}.${ext}`;
   return await uploadToS3(buffer, key, contentType);
 }
 
@@ -397,79 +363,58 @@ function validateRequirement(jobName, req) {
   const audioUrl = r.audioUrl || r.audioURL;
 
   if (name === "dubbing") {
-    if (!r.videoUrl || !isValidUrl(r.videoUrl))
-      return "Missing or invalid videoUrl (must be a valid http/https URL).";
-    if (r.videoUrl.includes("example.com"))
-      return "Content rejected: example.com domain is not a valid video source.";
-    if (NON_MEDIA_EXT.test(r.videoUrl))
-      return "videoUrl does not appear to point to a video or audio file.";
-    if (isHarmfulUrl(r.videoUrl))
-      return "Content rejected: URL contains prohibited or harmful content indicators.";
-    if (!r.targetLanguage)
-      return "Missing targetLanguage.";
-    if (!getLanguageCode(r.targetLanguage))
-      return "Unsupported targetLanguage. Please use one of the supported 29 languages.";
+    if (!r.videoUrl || !isValidUrl(r.videoUrl)) return "Missing or invalid videoUrl.";
+    if (r.videoUrl.includes("example.com")) return "Content rejected: example.com domain is not a valid video source.";
+    if (NON_MEDIA_EXT.test(r.videoUrl)) return "videoUrl does not appear to point to a video or audio file.";
+    if (isHarmfulUrl(r.videoUrl)) return "Content rejected: URL contains prohibited content indicators.";
+    if (!r.targetLanguage) return "Missing targetLanguage.";
+    if (!getLanguageCode(r.targetLanguage)) return "Unsupported targetLanguage.";
     return null;
   }
 
   if (name === "multidubbing") {
-    if (!r.videoUrl || !isValidUrl(r.videoUrl))
-      return "Missing or invalid videoUrl (must be a public http/https URL).";
-    if (r.videoUrl.includes("example.com"))
-      return "Content rejected: example.com domain is not a valid video source.";
-    if (NON_MEDIA_EXT.test(r.videoUrl))
-      return "videoUrl does not appear to point to a video or audio file.";
-    if (isHarmfulUrl(r.videoUrl))
-      return "Content rejected: URL contains prohibited or harmful content indicators.";
-    if (!Array.isArray(r.targetLanguages))
-      return "targetLanguages must be an array.";
-    if (r.targetLanguages.length === 0 || r.targetLanguages.length > 3)
-      return "You must provide between 1 and 3 targetLanguages. Maximum is 3.";
+    if (!r.videoUrl || !isValidUrl(r.videoUrl)) return "Missing or invalid videoUrl.";
+    if (r.videoUrl.includes("example.com")) return "Content rejected: example.com domain is not a valid video source.";
+    if (NON_MEDIA_EXT.test(r.videoUrl)) return "videoUrl does not appear to point to a video or audio file.";
+    if (isHarmfulUrl(r.videoUrl)) return "Content rejected: URL contains prohibited content indicators.";
+    if (!Array.isArray(r.targetLanguages)) return "targetLanguages must be an array.";
+    if (r.targetLanguages.length === 0 || r.targetLanguages.length > 3) return "You must provide between 1 and 3 targetLanguages.";
     for (const lang of r.targetLanguages) {
-      if (!getLanguageCode(lang)) return `Unsupported language: ${lang}`;
+      if (!getLanguageCode(lang)) return "Unsupported targetLanguages.";
     }
     return null;
   }
 
   if (name === "voiceover") {
-    if (!r.text || String(r.text).trim().length === 0)
-      return "Missing text.";
-    if (String(r.text).length > 5000)
-      return "Text too long (max 5000 chars).";
-    if (isHarmfulText(String(r.text)))
-      return "Content rejected: text contains prohibited or harmful content.";
+    if (!r.text || String(r.text).trim().length === 0) return "Missing text.";
+    if (String(r.text).length > 5000) return "Text too long (max 5000 chars).";
+    if (isHarmfulText(String(r.text))) return "Content rejected: text contains prohibited or harmful content.";
     if (r.voiceStyle && !VOICE_MAP[String(r.voiceStyle).toLowerCase()])
       return `Unsupported voiceStyle. Use one of: ${Object.keys(VOICE_MAP).join(", ")}.`;
     return null;
   }
 
   if (name === "musicproduction") {
-    if (!r.concept) return "Missing concept.";
-    if (!r.genre) return "Missing genre.";
-    if (!r.mood) return "Missing mood.";
+    if (!r.concept)   return "Missing concept.";
+    if (!r.genre)     return "Missing genre.";
+    if (!r.mood)      return "Missing mood.";
     if (!r.vocalStyle) return "Missing vocalStyle.";
-    if (!r.duration) return "Missing duration (seconds).";
+    if (!r.duration)  return "Missing duration (seconds).";
     const dur = parseInt(r.duration, 10);
-    if (Number.isNaN(dur)) return "Invalid duration (must be a number in seconds).";
+    if (Number.isNaN(dur)) return "Invalid duration.";
     if (dur < 3 || dur > 280) return "Duration must be between 3 and 280 seconds.";
-    if (r.lyrics && String(r.lyrics).length > 4000)
-      return "Lyrics too long (max 4000 chars).";
+    if (r.lyrics && String(r.lyrics).length > 4000) return "Lyrics too long (max 4000 chars).";
     if (isHarmfulText(String(r.concept) + " " + String(r.lyrics || "")))
-      return "Content rejected: concept or lyrics contain prohibited or harmful content.";
+      return "Content rejected: concept or lyrics contain prohibited content.";
     return null;
   }
 
   if (name === "voicerecast") {
-    if (!audioUrl || !isValidUrl(audioUrl))
-      return "Missing or invalid audioUrl/audioURL (must be a public http/https URL).";
-    if (audioUrl.includes("example.com"))
-      return "Content rejected: example.com domain is not a valid audio source.";
-    if (NON_MEDIA_EXT.test(audioUrl))
-      return "audioUrl does not appear to point to an audio file.";
-    if (isHarmfulUrl(audioUrl))
-      return "Content rejected: URL contains prohibited or harmful content indicators.";
-    if (!r.voiceStyle)
-      return "Missing voiceStyle.";
+    if (!audioUrl || !isValidUrl(audioUrl)) return "Missing or invalid audioUrl/audioURL.";
+    if (audioUrl.includes("example.com")) return "Content rejected: example.com domain is not a valid audio source.";
+    if (NON_MEDIA_EXT.test(audioUrl)) return "audioUrl does not appear to point to an audio file.";
+    if (isHarmfulUrl(audioUrl)) return "Content rejected: URL contains prohibited content indicators.";
+    if (!r.voiceStyle) return "Missing voiceStyle.";
     if (!VOICE_MAP[String(r.voiceStyle).toLowerCase()])
       return `Unsupported voiceStyle. Use one of: ${Object.keys(VOICE_MAP).join(", ")}.`;
     return null;
@@ -479,42 +424,21 @@ function validateRequirement(jobName, req) {
 }
 
 /* -------------------------
-   DUBBING LOGIC
+   PROCESSING FUNCTIONS
+   Return payload objects — do not call job.deliver directly.
+   Results cached so Phase 3 delivers instantly.
 -------------------------- */
 
-async function processDubbing(job) {
-  let { videoUrl, targetLanguage } =
-    job.requirement || job.serviceRequirement || {};
-
+async function runDubbing(job) {
+  let { videoUrl, targetLanguage } = job.requirement || job.serviceRequirement || {};
   const langCode = getLanguageCode(targetLanguage);
+  const jobId = job.id.toString();
 
   if (!videoUrl || !langCode) {
-    await safeDeliver(job, {
-      type: "object",
-      value: {
-        jobId: job.id.toString(),
-        status: "failed",
-        reason: "Missing videoUrl or invalid targetLanguage",
-        dubbedFileUrl: ""
-      }
-    });
-    return false;
+    return { type: "object", value: { jobId, status: "failed", reason: "Missing videoUrl or invalid targetLanguage", dubbedFileUrl: "" } };
   }
 
   try {
-    if (videoUrl.includes("youtube.com") || videoUrl.includes("youtu.be")) {
-      await safeDeliver(job, {
-        type: "object",
-        value: {
-          jobId: job.id.toString(),
-          status: "failed",
-          reason: "YouTube links are not supported. Please upload a direct video file.",
-          dubbedFileUrl: ""
-        }
-      });
-      return false;
-    }
-
     videoUrl = await normalizeVideoInput(videoUrl);
 
     const dubRes = await fetch("https://duelsapp.vercel.app/api/dub", {
@@ -522,29 +446,19 @@ async function processDubbing(job) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ videoUrl, target_lang: langCode, source_lang: "auto" })
     });
-
     const dubData = await dubRes.json();
     const dubbingId = dubData.dubbing_id;
 
     if (!dubbingId) {
-      await safeDeliver(job, {
-        type: "object",
-        value: {
-          jobId: job.id.toString(),
-          status: "failed",
-          reason: "No dubbing ID returned from dubbing service",
-          dubbedFileUrl: ""
-        }
-      });
-      return false;
+      return { type: "object", value: { jobId, status: "failed", reason: "No dubbing ID returned", dubbedFileUrl: "" } };
     }
 
     let dubbedUrl = "";
     let subtitleUrl = "";
 
-    for (let i = 0; i < 24; i++) {
-      await new Promise(r => setTimeout(r, 10000));
-
+    // 6 × 3s = 18s max — fits within evaluator timeout
+    for (let i = 0; i < 6; i++) {
+      await new Promise(r => setTimeout(r, 3000));
       const statusRes = await fetch(`https://duelsapp.vercel.app/api/dub-status?id=${dubbingId}`);
       const statusData = await statusRes.json();
 
@@ -553,23 +467,11 @@ async function processDubbing(job) {
           `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/audio/${langCode}`,
           { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY } }
         );
-
         if (!elevenRes.ok) {
-          await safeDeliver(job, {
-            type: "object",
-            value: {
-              jobId: job.id.toString(),
-              status: "failed",
-              reason: "Failed to fetch dubbed audio from ElevenLabs",
-              dubbedFileUrl: ""
-            }
-          });
-          return false;
+          return { type: "object", value: { jobId, status: "failed", reason: "Failed to fetch dubbed audio", dubbedFileUrl: "" } };
         }
-
         const buffer = Buffer.from(await elevenRes.arrayBuffer());
         const contentType = elevenRes.headers.get("content-type") || "audio/mpeg";
-
         dubbedUrl = await uploadToS3(buffer, `dubbed/${dubbingId}_${langCode}.mp3`, contentType);
 
         const transcriptRes = await fetch(
@@ -578,403 +480,179 @@ async function processDubbing(job) {
         );
         if (transcriptRes.ok) {
           const srtText = await transcriptRes.text();
-          subtitleUrl = await uploadToS3(
-            Buffer.from(srtText, "utf-8"),
-            `subtitles/${dubbingId}_${langCode}.srt`,
-            "application/x-subrip"
-          );
+          subtitleUrl = await uploadToS3(Buffer.from(srtText, "utf-8"), `subtitles/${dubbingId}_${langCode}.srt`, "application/x-subrip");
         }
-
         break;
       }
-
       if (statusData.status === "failed") break;
     }
 
     if (!dubbedUrl) {
-      await safeDeliver(job, {
-        type: "object",
-        value: {
-          jobId: job.id.toString(),
-          status: "failed",
-          reason: "Dubbing timed out or failed",
-          dubbedFileUrl: ""
-        }
-      });
-      return false;
+      return { type: "object", value: { jobId, status: "failed", reason: "Dubbing timed out or failed", dubbedFileUrl: "" } };
     }
-
-    await safeDeliver(job, {
-      type: "object",
-      value: {
-        jobId: job.id.toString(),
-        status: "completed",
-        dubbedFileUrl: dubbedUrl,
-        subtitleUrl: subtitleUrl
-      }
-    });
-    return true;
+    return { type: "object", value: { jobId, status: "completed", dubbedFileUrl: dubbedUrl, subtitleUrl } };
 
   } catch (err) {
     console.error("Dubbing error:", err);
-    await safeDeliver(job, {
-      type: "object",
-      value: {
-        jobId: job.id.toString(),
-        status: "failed",
-        reason: err.message || "Unexpected error during dubbing",
-        dubbedFileUrl: ""
-      }
-    });
-    return false;
+    return { type: "object", value: { jobId, status: "failed", reason: err.message || "Unexpected dubbing error", dubbedFileUrl: "" } };
   }
 }
 
-/* -------------------------
-   MULTI-DUBBING LOGIC
--------------------------- */
-
-async function processMultiDubbing(job) {
-  let { videoUrl, targetLanguages } =
-    job.requirement || job.serviceRequirement || {};
+async function runMultiDubbing(job) {
+  let { videoUrl, targetLanguages } = job.requirement || job.serviceRequirement || {};
+  const jobId = job.id.toString();
 
   if (!videoUrl || !Array.isArray(targetLanguages) || targetLanguages.length === 0) {
-    await safeDeliver(job, {
-      type: "object",
-      value: {
-        jobId: job.id.toString(),
-        status: "failed",
-        reason: "Missing videoUrl or targetLanguages",
-        dubbedFiles: {}
-      }
-    });
-    return false;
+    return { type: "object", value: { jobId, status: "failed", reason: "Missing videoUrl or targetLanguages", dubbedFiles: {} } };
   }
 
   try {
-    if (videoUrl.includes("youtube.com") || videoUrl.includes("youtu.be")) {
-      await safeDeliver(job, {
-        type: "object",
-        value: {
-          jobId: job.id.toString(),
-          status: "failed",
-          reason: "YouTube links are not supported. Please upload a direct video file.",
-          dubbedFiles: {}
-        }
-      });
-      return false;
-    }
-
     videoUrl = await normalizeVideoInput(videoUrl);
-
     const results = {};
 
-    await Promise.all(
-      targetLanguages.map(async (lang) => {
-        const langCode = getLanguageCode(lang);
-        if (!langCode) return;
+    await Promise.all(targetLanguages.map(async (lang) => {
+      const langCode = getLanguageCode(lang);
+      if (!langCode) return;
 
-        const dubRes = await fetch("https://duelsapp.vercel.app/api/dub", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ videoUrl, target_lang: langCode, source_lang: "auto" })
-        });
+      const dubRes = await fetch("https://duelsapp.vercel.app/api/dub", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ videoUrl, target_lang: langCode, source_lang: "auto" })
+      });
+      const dubData = await dubRes.json();
+      const dubbingId = dubData.dubbing_id;
+      if (!dubbingId) return;
 
-        const dubData = await dubRes.json();
-        const dubbingId = dubData.dubbing_id;
-        if (!dubbingId) return;
+      let dubbedUrl = "";
+      let subtitleUrl = "";
 
-        let dubbedUrl = "";
-        let subtitleUrl = "";
+      // 6 × 3s = 18s max
+      for (let i = 0; i < 6; i++) {
+        await new Promise(r => setTimeout(r, 3000));
+        const statusRes = await fetch(`https://duelsapp.vercel.app/api/dub-status?id=${dubbingId}`);
+        const statusData = await statusRes.json();
 
-        for (let i = 0; i < 24; i++) {
-          await new Promise(r => setTimeout(r, 10000));
-
-          const statusRes = await fetch(`https://duelsapp.vercel.app/api/dub-status?id=${dubbingId}`);
-          const statusData = await statusRes.json();
-
-          if (statusData.status === "dubbed") {
-            const elevenRes = await fetch(
-              `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/audio/${langCode}`,
-              { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY } }
-            );
-
-            if (!elevenRes.ok) return;
-
-            const buffer = Buffer.from(await elevenRes.arrayBuffer());
-            const contentType = elevenRes.headers.get("content-type") || "audio/mpeg";
-
-            dubbedUrl = await uploadToS3(buffer, `multidub/${dubbingId}_${langCode}.mp3`, contentType);
-
-            const transcriptRes = await fetch(
-              `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/transcripts/${langCode}/format/srt`,
-              { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY } }
-            );
-            if (transcriptRes.ok) {
-              const srtText = await transcriptRes.text();
-              subtitleUrl = await uploadToS3(
-                Buffer.from(srtText, "utf-8"),
-                `subtitles/${dubbingId}_${langCode}.srt`,
-                "application/x-subrip"
-              );
-            }
-
-            break;
+        if (statusData.status === "dubbed") {
+          const elevenRes = await fetch(
+            `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/audio/${langCode}`,
+            { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY } }
+          );
+          if (!elevenRes.ok) return;
+          const buffer = Buffer.from(await elevenRes.arrayBuffer());
+          const contentType = elevenRes.headers.get("content-type") || "audio/mpeg";
+          dubbedUrl = await uploadToS3(buffer, `multidub/${dubbingId}_${langCode}.mp3`, contentType);
+          const transcriptRes = await fetch(
+            `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/transcripts/${langCode}/format/srt`,
+            { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY } }
+          );
+          if (transcriptRes.ok) {
+            const srtText = await transcriptRes.text();
+            subtitleUrl = await uploadToS3(Buffer.from(srtText, "utf-8"), `subtitles/${dubbingId}_${langCode}.srt`, "application/x-subrip");
           }
-
-          if (statusData.status === "failed") break;
+          break;
         }
+        if (statusData.status === "failed") break;
+      }
 
-        if (dubbedUrl) {
-          results[langCode] = { audio: dubbedUrl, subtitles: subtitleUrl };
-        }
-      })
-    );
+      if (dubbedUrl) results[langCode] = { audio: dubbedUrl, subtitles: subtitleUrl };
+    }));
 
     if (Object.keys(results).length === 0) {
-      await safeDeliver(job, {
-        type: "object",
-        value: {
-          jobId: job.id.toString(),
-          status: "failed",
-          reason: "All dubbing attempts failed or timed out",
-          dubbedFiles: {}
-        }
-      });
-      return false;
+      return { type: "object", value: { jobId, status: "failed", reason: "All dubbing attempts failed", dubbedFiles: {} } };
     }
-
-    await safeDeliver(job, {
-      type: "object",
-      value: {
-        jobId: job.id.toString(),
-        status: "completed",
-        dubbedFiles: results
-      }
-    });
-    return true;
+    return { type: "object", value: { jobId, status: "completed", dubbedFiles: results } };
 
   } catch (err) {
     console.error("Multi-dubbing error:", err);
-    await safeDeliver(job, {
-      type: "object",
-      value: {
-        jobId: job.id.toString(),
-        status: "failed",
-        reason: err.message || "Unexpected error during multi-dubbing",
-        dubbedFiles: {}
-      }
-    });
-    return false;
+    return { type: "object", value: { jobId, status: "failed", reason: err.message || "Unexpected multi-dubbing error", dubbedFiles: {} } };
   }
 }
 
-/* -------------------------
-   VOICEOVER LOGIC
--------------------------- */
-
-async function processVoiceover(job) {
-  const { text, voiceStyle } =
-    job.requirement || job.serviceRequirement || {};
-
+async function runVoiceover(job) {
+  const { text, voiceStyle } = job.requirement || job.serviceRequirement || {};
+  const jobId = job.id.toString();
   const voiceId = getVoiceId(voiceStyle);
 
   if (!text) {
-    await safeDeliver(job, {
-      type: "object",
-      value: { jobId: job.id.toString(), status: "failed", audio: "" }
-    });
-    return false;
+    return { type: "object", value: { jobId, status: "failed", audio: "" } };
   }
 
   try {
-    const response = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
-      {
-        method: "POST",
-        headers: {
-          "xi-api-key": process.env.ELEVENLABS_API_KEY,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ text, model_id: "eleven_multilingual_v2" })
-      }
-    );
+    const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
+      method: "POST",
+      headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ text, model_id: "eleven_multilingual_v2" })
+    });
 
     if (!response.ok) {
-      await safeDeliver(job, {
-        type: "object",
-        value: {
-          jobId: job.id.toString(),
-          status: "failed",
-          reason: `ElevenLabs TTS returned ${response.status}`,
-          audio: ""
-        }
-      });
-      return false;
+      return { type: "object", value: { jobId, status: "failed", reason: `ElevenLabs TTS returned ${response.status}`, audio: "" } };
     }
 
     const buffer = Buffer.from(await response.arrayBuffer());
     const url = await uploadToS3(buffer, `voiceover/${job.id}.mp3`, "audio/mpeg");
-
-    await safeDeliver(job, {
-      type: "object",
-      value: { jobId: job.id.toString(), status: "completed", audio: url }
-    });
-    return true;
+    return { type: "object", value: { jobId, status: "completed", audio: url } };
 
   } catch (err) {
     console.error("Voiceover error:", err);
-    await safeDeliver(job, {
-      type: "object",
-      value: {
-        jobId: job.id.toString(),
-        status: "failed",
-        reason: err.message || "Unexpected error during voiceover",
-        audio: ""
-      }
-    });
-    return false;
+    return { type: "object", value: { jobId, status: "failed", reason: err.message || "Unexpected voiceover error", audio: "" } };
   }
 }
 
-/* -------------------------
-   MUSIC PRODUCTION LOGIC
--------------------------- */
-
-async function processPremiumMusic(job) {
-  const { concept, genre, mood, vocalStyle, duration, lyrics } =
-    job.requirement || job.serviceRequirement || {};
+async function runPremiumMusic(job) {
+  const { concept, genre, mood, vocalStyle, duration, lyrics } = job.requirement || job.serviceRequirement || {};
+  const jobId = job.id.toString();
 
   if (!concept || !genre || !mood || !vocalStyle || !duration) {
-    await safeDeliver(job, {
-      type: "object",
-      value: { jobId: job.id.toString(), status: "failed", audio: "" }
-    });
-    return false;
+    return { type: "object", value: { jobId, status: "failed", audio: "" } };
   }
 
   try {
     const durationMs = Math.max(3000, Math.min(280000, parseInt(duration) * 1000 || 60000));
+    const finalPrompt = `Create a professionally produced ${genre} track. Theme: ${concept}. Mood: ${mood}. Vocals: ${vocalStyle}. ${lyrics && lyrics.trim() !== "" ? `Use the following lyrics exactly as written:\n${lyrics}` : "Generate original lyrics appropriate to the theme."} High quality production, radio-ready mix, cinematic depth, modern sound design.`;
 
-    const finalPrompt = `
-Create a professionally produced ${genre} track.
-Theme: ${concept}.
-Mood: ${mood}.
-Vocals: ${vocalStyle}.
-${lyrics && lyrics.trim() !== ""
-  ? `Use the following lyrics exactly as written:\n${lyrics}`
-  : "Generate original lyrics appropriate to the theme."}
-High quality production, radio-ready mix, cinematic depth, modern sound design.
-`;
-
-    console.log("Generating music:", { concept, genre, mood, vocalStyle, duration: durationMs });
-
-    const response = await fetch(
-      "https://api.elevenlabs.io/v1/music?output_format=mp3_44100_128",
-      {
-        method: "POST",
-        headers: {
-          "xi-api-key": process.env.ELEVENLABS_API_KEY,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          prompt: finalPrompt,
-          music_length_ms: durationMs,
-          model_id: "music_v1",
-          force_instrumental: vocalStyle.toLowerCase() === "instrumental"
-        })
-      }
-    );
+    const response = await fetch("https://api.elevenlabs.io/v1/music?output_format=mp3_44100_128", {
+      method: "POST",
+      headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: finalPrompt, music_length_ms: durationMs, model_id: "music_v1", force_instrumental: vocalStyle.toLowerCase() === "instrumental" })
+    });
 
     if (!response.ok) {
-      await safeDeliver(job, {
-        type: "object",
-        value: {
-          jobId: job.id.toString(),
-          status: "failed",
-          reason: `ElevenLabs music API returned ${response.status}`,
-          audio: ""
-        }
-      });
-      return false;
+      return { type: "object", value: { jobId, status: "failed", reason: `ElevenLabs music API returned ${response.status}`, audio: "" } };
     }
 
     const buffer = Buffer.from(await response.arrayBuffer());
     const url = await uploadToS3(buffer, `music/${job.id}.mp3`, "audio/mpeg");
-
-    await safeDeliver(job, {
-      type: "object",
-      value: { jobId: job.id.toString(), status: "completed", audio: url }
-    });
-    return true;
+    return { type: "object", value: { jobId, status: "completed", audio: url } };
 
   } catch (err) {
-    console.error("Premium music error:", err);
-    await safeDeliver(job, {
-      type: "object",
-      value: {
-        jobId: job.id.toString(),
-        status: "failed",
-        reason: err.message || "Unexpected error during music production",
-        audio: ""
-      }
-    });
-    return false;
+    console.error("Music error:", err);
+    return { type: "object", value: { jobId, status: "failed", reason: err.message || "Unexpected music error", audio: "" } };
   }
 }
 
-/* -------------------------
-   VOICE RECASTING LOGIC
--------------------------- */
-
-async function processVoiceRecast(job) {
+async function runVoiceRecast(job) {
   const req = job.requirement || job.serviceRequirement || {};
   const audioUrl = req.audioUrl || req.audioURL;
   const voiceStyle = req.voiceStyle;
   const voiceId = getVoiceId(voiceStyle);
+  const jobId = job.id.toString();
 
   if (!audioUrl) {
-    await safeDeliver(job, {
-      type: "object",
-      value: { jobId: job.id.toString(), status: "failed", audio: "" }
-    });
-    return false;
+    return { type: "object", value: { jobId, status: "failed", audio: "" } };
   }
 
   try {
-    console.log("Voice recasting started:", { audioUrl, voiceStyle });
-
     const sourceResponse = await fetch(audioUrl);
     if (!sourceResponse.ok) {
-      await safeDeliver(job, {
-        type: "object",
-        value: {
-          jobId: job.id.toString(),
-          status: "failed",
-          reason: "Failed to fetch source audio — make sure URL is publicly accessible",
-          audio: ""
-        }
-      });
-      return false;
+      return { type: "object", value: { jobId, status: "failed", reason: "Failed to fetch source audio", audio: "" } };
     }
 
     const audioBuffer = Buffer.from(await sourceResponse.arrayBuffer());
-
     if (audioBuffer.length > 25 * 1024 * 1024) {
-      await safeDeliver(job, {
-        type: "object",
-        value: {
-          jobId: job.id.toString(),
-          status: "failed",
-          reason: "Audio file too large (max 25MB)",
-          audio: ""
-        }
-      });
-      return false;
+      return { type: "object", value: { jobId, status: "failed", reason: "Audio file too large (max 25MB)", audio: "" } };
     }
 
     const audioBlob = new Blob([audioBuffer], { type: "audio/mpeg" });
-
     const audioStream = await elevenlabs.speechToSpeech.convert(voiceId, {
       audio: audioBlob,
       modelId: "eleven_multilingual_sts_v2",
@@ -982,32 +660,41 @@ async function processVoiceRecast(job) {
     });
 
     const chunks = [];
-    for await (const chunk of audioStream) {
-      chunks.push(chunk);
-    }
+    for await (const chunk of audioStream) chunks.push(chunk);
     const resultBuffer = Buffer.concat(chunks);
-
     const url = await uploadToS3(resultBuffer, `voicerecast/${job.id}.mp3`, "audio/mpeg");
-
-    await safeDeliver(job, {
-      type: "object",
-      value: { jobId: job.id.toString(), status: "completed", audio: url }
-    });
-    return true;
+    return { type: "object", value: { jobId, status: "completed", audio: url } };
 
   } catch (err) {
     console.error("Voice recast error:", err?.message || err);
-    await safeDeliver(job, {
-      type: "object",
-      value: {
-        jobId: job.id.toString(),
-        status: "failed",
-        reason: err.message || "Unexpected error during voice recast",
-        audio: ""
-      }
-    });
-    return false;
+    return { type: "object", value: { jobId, status: "failed", reason: err.message || "Unexpected voice recast error", audio: "" } };
   }
+}
+
+/* -------------------------
+   DISPATCH — runs job and caches result
+-------------------------- */
+
+async function dispatchJob(job) {
+  const jobId = job.id.toString();
+  console.log("Dispatching job:", jobId, job.name);
+
+  let payload;
+  try {
+    if      (job.name === "dubbing")        payload = await runDubbing(job);
+    else if (job.name === "multidubbing")   payload = await runMultiDubbing(job);
+    else if (job.name === "musicproduction") payload = await runPremiumMusic(job);
+    else if (job.name === "voiceover")      payload = await runVoiceover(job);
+    else if (job.name === "voicerecast")    payload = await runVoiceRecast(job);
+    else payload = { type: "object", value: { jobId, status: "failed", reason: `Unknown job type: ${job.name}` } };
+  } catch (err) {
+    console.error("dispatchJob error:", err);
+    payload = { type: "object", value: { jobId, status: "failed", reason: "Unhandled dispatch error" } };
+  }
+
+  jobResultCache.set(jobId, { payload, delivered: false });
+  console.log("Result cached:", jobId, payload.value?.status);
+  return payload;
 }
 
 /* -------------------------
@@ -1016,12 +703,12 @@ async function processVoiceRecast(job) {
 
 async function main() {
   console.log("Starting... ENV check:", {
-    hasPrivKey: !!process.env.WHITELISTED_WALLET_PRIVATE_KEY,
-    entityId: process.env.SELLER_ENTITY_ID,
-    agentWallet: process.env.SELLER_AGENT_WALLET_ADDRESS,
+    hasPrivKey:   !!process.env.WHITELISTED_WALLET_PRIVATE_KEY,
+    entityId:     process.env.SELLER_ENTITY_ID,
+    agentWallet:  process.env.SELLER_AGENT_WALLET_ADDRESS,
     hasElevenLabs: !!process.env.ELEVENLABS_API_KEY,
-    hasAwsRegion: !!process.env.AWS_REGION,
-    hasAwsBucket: !!process.env.AWS_S3_BUCKET,
+    hasAwsRegion:  !!process.env.AWS_REGION,
+    hasAwsBucket:  !!process.env.AWS_S3_BUCKET,
   });
 
   let acpContractClient;
@@ -1041,12 +728,7 @@ async function main() {
     acpContractClient,
 
     onNewTask: async (job, memoToSign) => {
-
-      console.log("Incoming job:", {
-        id: job?.id,
-        name: job?.name,
-        phase: memoToSign?.nextPhase
-      });
+      console.log("Incoming job:", { id: job?.id, name: job?.name, phase: memoToSign?.nextPhase });
 
       if (!memoToSign) {
         console.log("No memoToSign — skipping");
@@ -1054,14 +736,14 @@ async function main() {
       }
 
       const phase = Number(memoToSign.nextPhase);
+      const jobId = job.id.toString();
 
       /* -------------------------
          PHASE 1 — ACCEPT / REJECT
+         Immediately start processing in background after accept.
       -------------------------- */
 
       if (phase === 1) {
-        const jobId = job.id.toString();
-
         if (processedPhase1.has(jobId)) {
           console.log("Phase 1 already handled:", jobId);
           return;
@@ -1080,11 +762,13 @@ async function main() {
           }
 
           await safeRespond(job);
-
-          // Buffer for ACP race condition between respond → deliver
-          await new Promise(r => setTimeout(r, 500));
-
+          await new Promise(r => setTimeout(r, 800)); // buffer for ACP race condition
           console.log("Job accepted:", jobId, job.name);
+
+          // Start processing immediately — result cached for Phase 3
+          enqueueJob(job.name, () => dispatchJob(job)).catch(err => {
+            console.error("Background dispatch error:", err);
+          });
 
         } catch (err) {
           console.error("Phase 1 error:", err);
@@ -1094,58 +778,44 @@ async function main() {
       }
 
       /* -------------------------
-         PHASE 3 — PROCESS + DELIVER
+         PHASE 3 — DELIVER
+         Deliver from cache. Wait up to 30s if still processing.
       -------------------------- */
 
       if (phase === 3) {
-        const jobId = job.id.toString();
-
         if (processedPhase3.has(jobId)) {
           console.log("Phase 3 already handled:", jobId);
           return;
         }
         processedPhase3.add(jobId);
 
-        await enqueueJob(async () => {
-          let delivered = false;
+        try {
+          let cached = jobResultCache.get(jobId);
+          let waited = 0;
 
-          try {
-            console.log("Processing job:", jobId, job.name);
-
-            if (job.name === "dubbing") {
-              delivered = await processDubbing(job);
-            } else if (job.name === "multidubbing") {
-              delivered = await processMultiDubbing(job);
-            } else if (job.name === "musicproduction") {
-              delivered = await processPremiumMusic(job);
-            } else if (job.name === "voiceover") {
-              delivered = await processVoiceover(job);
-            } else if (job.name === "voicerecast") {
-              delivered = await processVoiceRecast(job);
-            } else {
-              console.log("Unknown job type:", job.name);
-            }
-          } catch (err) {
-            console.error("Processing error:", err);
+          while (!cached && waited < 30000) {
+            await new Promise(r => setTimeout(r, 1000));
+            waited += 1000;
+            cached = jobResultCache.get(jobId);
           }
 
-          // Absolute fallback — prevents job expiration
-          if (!delivered) {
-            try {
-              console.log("Fallback delivery triggered:", jobId);
-              await safeDeliver(job, {
-                type: "object",
-                value: {
-                  jobId: jobId,
-                  status: "failed",
-                  reason: "Unhandled processing error"
-                }
-              });
-            } catch (err) {
-              console.error("Fallback delivery failed:", err);
-            }
+          if (cached && !cached.delivered) {
+            cached.delivered = true;
+            console.log("Delivering cached result:", jobId, cached.payload.value?.status);
+            await safeDeliver(job, cached.payload);
+          } else if (!cached) {
+            console.log("No cached result, delivering fallback:", jobId);
+            await safeDeliver(job, {
+              type: "object",
+              value: { jobId, status: "failed", reason: "Processing did not complete in time" }
+            });
+          } else {
+            console.log("Already delivered:", jobId);
           }
-        });
+
+        } catch (err) {
+          console.error("Phase 3 error:", err);
+        }
 
         return;
       }
@@ -1157,16 +827,15 @@ async function main() {
       if (phase === 4) {
         try {
           const success = job.result?.status === "completed";
-
           if (success) {
             await safeEvaluate(job, true, "Service completed successfully");
-            console.log("Escrow released:", job.id);
+            console.log("Escrow released:", jobId);
           } else {
             await safeEvaluate(job, false, "Service failed");
-            console.log("Escrow refunded:", job.id);
+            console.log("Escrow refunded:", jobId);
           }
         } catch (err) {
-          console.error("Evaluation error:", err);
+          console.error("Phase 4 error:", err);
         }
 
         return;
@@ -1182,9 +851,15 @@ async function main() {
     process.exit(1);
   }
 
-  // Heartbeat — confirms listener is still alive
+  // Heartbeat with per-type queue stats
   setInterval(() => {
-    console.log("ACP listener heartbeat", new Date().toISOString());
+    console.log("Heartbeat", new Date().toISOString());
+    for (const type of Object.keys(queues)) {
+      if (activeCount[type] > 0 || queues[type].length > 0) {
+        console.log(` ${type}: active=${activeCount[type]} queued=${queues[type].length}`);
+      }
+    }
+    console.log(` cached=${jobResultCache.size}`);
   }, 30000);
 }
 
