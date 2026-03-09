@@ -7,6 +7,18 @@ if (process.env.YOUTUBE_COOKIES) {
   fs.writeFileSync("/tmp/youtube_cookies.txt", process.env.YOUTUBE_COOKIES);
 }
 
+/* -------------------------
+   GLOBAL CRASH GUARDS
+   Must be first — prevents Node from exiting on ACP RPC errors
+-------------------------- */
+
+process.on("unhandledRejection", err => {
+  console.error("UNHANDLED REJECTION (process continuing):", err);
+});
+
+process.on("uncaughtException", err => {
+  console.error("UNCAUGHT EXCEPTION (process continuing):", err);
+});
 
 const { default: AcpClient, AcpContractClientV2 } = pkg;
 
@@ -85,14 +97,16 @@ function getVoiceId(style) {
 
 /* -------------------------
    CONCURRENCY QUEUE
-   FIX #2: Increased to 18 so evaluator's simultaneous
-   jobs don't queue up and expire before starting.
+   Capped at 6 to avoid RPC overload during evaluations
 -------------------------- */
 
-const MAX_CONCURRENT_JOBS = 30;
+const MAX_CONCURRENT_JOBS = 6;
 let activeJobCount = 0;
 const jobQueue = [];
-const processedJobs = new Set();
+
+// Phase-level deduplication sets
+const processedPhase1 = new Set();
+const processedPhase3 = new Set();
 
 function enqueueJob(fn) {
   return new Promise((resolve, reject) => {
@@ -113,6 +127,39 @@ function drainQueue() {
         drainQueue();
       });
   }
+}
+
+/* -------------------------
+   RETRY WRAPPER
+   Handles intermittent ACP RPC 500 errors
+-------------------------- */
+
+async function retry(fn, attempts = 4) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      console.log(`Retry attempt ${i + 1}/${attempts}:`, err?.message || err);
+      if (i === attempts - 1) throw err;
+      await new Promise(r => setTimeout(r, 1500 * (i + 1)));
+    }
+  }
+}
+
+async function safeRespond(job) {
+  return retry(() => job.respond(true));
+}
+
+async function safeReject(job, reason) {
+  return retry(() => job.reject(reason));
+}
+
+async function safeDeliver(job, payload) {
+  return retry(() => job.deliver(payload));
+}
+
+async function safeEvaluate(job, success, message) {
+  return retry(() => job.evaluate(success, message));
 }
 
 /* -------------------------
@@ -150,8 +197,6 @@ function isValidUrl(u) {
 
 /* -------------------------
    CONTENT MODERATION
-   FIX #4: Added example.com rejection +
-   expanded harmful patterns per Yang's notes.
 -------------------------- */
 
 const HARMFUL_URL_PATTERNS = [
@@ -171,9 +216,13 @@ const HARMFUL_TEXT_PATTERNS = [
   /suicide/i,
   /graphic\s+violen/i,
   /explicit\s+violen/i,
+  /explicit\s+erot/i,
+  /erotic\s+stor/i,
   /rape/i,
   /child\s+(porn|abuse|exploit)/i,
   /bomb\s+(how|make|build|instruct)/i,
+  /manufactur.*(weapon|explos)/i,
+  /illegal\s+weapon/i,
   /terrorist/i,
   /terrorism/i,
   /hate\s+speech/i,
@@ -195,7 +244,8 @@ function isHarmfulText(text) {
 -------------------------- */
 
 function extractGoogleDriveId(url) {
-  const fileMatch = url.match(/\/file\/d\/([^/]+)/);
+  // Handles /file/d/ID, /videos/d/ID, /document/d/ID, open?id=ID
+  const fileMatch = url.match(/\/(?:file|videos|document|presentation|spreadsheets)\/d\/([^/]+)/);
   if (fileMatch) return fileMatch[1];
   const openMatch = url.match(/[?&]id=([^&]+)/);
   if (openMatch) return openMatch[1];
@@ -208,10 +258,6 @@ function transformDropbox(url) {
     .replace("www.dropbox.com", "dl.dropboxusercontent.com");
 }
 
-/**
- * Google Drive returns an HTML virus scan warning page for files >~40MB.
- * We detect this, extract the confirm token, and retry with confirmation.
- */
 async function fetchGoogleDriveFile(fileId) {
   const directUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
 
@@ -236,7 +282,7 @@ async function fetchGoogleDriveFile(fileId) {
     return { response, contentType };
   }
 
-  // Large file — extract confirm token from warning page and retry
+  // Large file — extract confirm token from virus-scan warning page
   const html = await response.text();
   const confirmMatch = html.match(/confirm=([0-9A-Za-z_\-]+)/);
   const uuidMatch = html.match(/uuid=([0-9A-Za-z_\-]+)/);
@@ -270,17 +316,16 @@ async function fetchGoogleDriveFile(fileId) {
 }
 
 async function normalizeVideoInput(url) {
-  // Block YouTube
   if (url.includes("youtube.com") || url.includes("youtu.be")) {
-    throw new Error(
-      "YouTube links are not supported. Please upload a direct video file."
-    );
+    throw new Error("YouTube links are not supported. Please upload a direct video file.");
   }
 
-  // Google Drive: use dedicated handler that bypasses virus scan page
-  if (url.includes("drive.google.com")) {
+  // Handle both drive.google.com and docs.google.com
+  if (url.includes("drive.google.com") || url.includes("docs.google.com")) {
     const fileId = extractGoogleDriveId(url);
-    if (!fileId) throw new Error("Invalid Google Drive link format.");
+    if (!fileId) throw new Error(
+      "Invalid Google link format. Please share via Google Drive using 'Copy link' on the file."
+    );
 
     const { response, contentType } = await fetchGoogleDriveFile(fileId);
 
@@ -300,12 +345,10 @@ async function normalizeVideoInput(url) {
     return await uploadToS3(buffer, key, contentType);
   }
 
-  // Dropbox: convert share URL to direct download
   if (url.includes("dropbox.com")) {
     url = transformDropbox(url);
   }
 
-  // All other direct URLs
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30000);
 
@@ -323,9 +366,7 @@ async function normalizeVideoInput(url) {
   const contentType = response.headers.get("content-type") || "";
 
   if (contentType.includes("text/html")) {
-    throw new Error(
-      "Link returned an HTML page instead of a file. Please use a direct download URL."
-    );
+    throw new Error("Link returned an HTML page instead of a file. Please use a direct download URL.");
   }
 
   if (!contentType.includes("video") && !contentType.includes("audio")) {
@@ -346,8 +387,6 @@ async function normalizeVideoInput(url) {
 
 /* -------------------------
    VALIDATION
-   FIX #4: Reject example.com URLs immediately —
-   evaluator uses these as fake harmful test URLs.
 -------------------------- */
 
 const NON_MEDIA_EXT = /\.(txt|pdf|html|htm|jpg|jpeg|png|gif|svg|json|xml|csv|zip|doc|docx)(\?.*)?$/i;
@@ -441,9 +480,6 @@ function validateRequirement(jobName, req) {
 
 /* -------------------------
    DUBBING LOGIC
-   FIX #1: Reduced poll loop from 24×10s to 12×5s (max 60s)
-   FIX #5: Deliver failure explicitly instead of throwing
-           to prevent job expiration on timeout.
 -------------------------- */
 
 async function processDubbing(job) {
@@ -453,7 +489,7 @@ async function processDubbing(job) {
   const langCode = getLanguageCode(targetLanguage);
 
   if (!videoUrl || !langCode) {
-    await job.deliver({
+    await safeDeliver(job, {
       type: "object",
       value: {
         jobId: job.id.toString(),
@@ -467,7 +503,7 @@ async function processDubbing(job) {
 
   try {
     if (videoUrl.includes("youtube.com") || videoUrl.includes("youtu.be")) {
-      await job.deliver({
+      await safeDeliver(job, {
         type: "object",
         value: {
           jobId: job.id.toString(),
@@ -484,17 +520,14 @@ async function processDubbing(job) {
     const dubRes = await fetch("https://duelsapp.vercel.app/api/dub", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        videoUrl,
-        target_lang: langCode,
-        source_lang: "auto"
-      })
+      body: JSON.stringify({ videoUrl, target_lang: langCode, source_lang: "auto" })
     });
 
     const dubData = await dubRes.json();
     const dubbingId = dubData.dubbing_id;
+
     if (!dubbingId) {
-      await job.deliver({
+      await safeDeliver(job, {
         type: "object",
         value: {
           jobId: job.id.toString(),
@@ -509,13 +542,10 @@ async function processDubbing(job) {
     let dubbedUrl = "";
     let subtitleUrl = "";
 
-    // FIX #1: 6 x 3s
-    for (let i = 0; i < 6; i++) {
-      await new Promise(r => setTimeout(r, 3000));
+    for (let i = 0; i < 24; i++) {
+      await new Promise(r => setTimeout(r, 10000));
 
-      const statusRes = await fetch(
-        `https://duelsapp.vercel.app/api/dub-status?id=${dubbingId}`
-      );
+      const statusRes = await fetch(`https://duelsapp.vercel.app/api/dub-status?id=${dubbingId}`);
       const statusData = await statusRes.json();
 
       if (statusData.status === "dubbed") {
@@ -523,8 +553,9 @@ async function processDubbing(job) {
           `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/audio/${langCode}`,
           { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY } }
         );
+
         if (!elevenRes.ok) {
-          await job.deliver({
+          await safeDeliver(job, {
             type: "object",
             value: {
               jobId: job.id.toString(),
@@ -539,13 +570,8 @@ async function processDubbing(job) {
         const buffer = Buffer.from(await elevenRes.arrayBuffer());
         const contentType = elevenRes.headers.get("content-type") || "audio/mpeg";
 
-        dubbedUrl = await uploadToS3(
-          buffer,
-          `dubbed/${dubbingId}_${langCode}.mp3`,
-          contentType
-        );
+        dubbedUrl = await uploadToS3(buffer, `dubbed/${dubbingId}_${langCode}.mp3`, contentType);
 
-        // Fetch subtitles (SRT) — soft fail, does not block delivery
         const transcriptRes = await fetch(
           `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/transcripts/${langCode}/format/srt`,
           { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY } }
@@ -565,9 +591,8 @@ async function processDubbing(job) {
       if (statusData.status === "failed") break;
     }
 
-    // FIX #5: Deliver failure instead of throwing to prevent expiration
     if (!dubbedUrl) {
-      await job.deliver({
+      await safeDeliver(job, {
         type: "object",
         value: {
           jobId: job.id.toString(),
@@ -579,7 +604,7 @@ async function processDubbing(job) {
       return false;
     }
 
-    await job.deliver({
+    await safeDeliver(job, {
       type: "object",
       value: {
         jobId: job.id.toString(),
@@ -592,8 +617,7 @@ async function processDubbing(job) {
 
   } catch (err) {
     console.error("Dubbing error:", err);
-    // FIX #5: Always deliver on catch — never let job expire silently
-    await job.deliver({
+    await safeDeliver(job, {
       type: "object",
       value: {
         jobId: job.id.toString(),
@@ -608,8 +632,6 @@ async function processDubbing(job) {
 
 /* -------------------------
    MULTI-DUBBING LOGIC
-   FIX #1: Reduced poll loop from 24×10s to 12×5s
-   FIX #5: Deliver failure explicitly on all error paths
 -------------------------- */
 
 async function processMultiDubbing(job) {
@@ -617,7 +639,7 @@ async function processMultiDubbing(job) {
     job.requirement || job.serviceRequirement || {};
 
   if (!videoUrl || !Array.isArray(targetLanguages) || targetLanguages.length === 0) {
-    await job.deliver({
+    await safeDeliver(job, {
       type: "object",
       value: {
         jobId: job.id.toString(),
@@ -631,7 +653,7 @@ async function processMultiDubbing(job) {
 
   try {
     if (videoUrl.includes("youtube.com") || videoUrl.includes("youtu.be")) {
-      await job.deliver({
+      await safeDeliver(job, {
         type: "object",
         value: {
           jobId: job.id.toString(),
@@ -649,93 +671,68 @@ async function processMultiDubbing(job) {
 
     await Promise.all(
       targetLanguages.map(async (lang) => {
-    
         const langCode = getLanguageCode(lang);
         if (!langCode) return;
-    
+
         const dubRes = await fetch("https://duelsapp.vercel.app/api/dub", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            videoUrl,
-            target_lang: langCode,
-            source_lang: "auto"
-          })
+          body: JSON.stringify({ videoUrl, target_lang: langCode, source_lang: "auto" })
         });
-    
+
         const dubData = await dubRes.json();
         const dubbingId = dubData.dubbing_id;
         if (!dubbingId) return;
-    
+
         let dubbedUrl = "";
         let subtitleUrl = "";
-    
-        for (let i = 0; i < 12; i++) {
-          await new Promise(r => setTimeout(r, 5000));
-    
-          const statusRes = await fetch(
-            `https://duelsapp.vercel.app/api/dub-status?id=${dubbingId}`
-          );
-    
+
+        for (let i = 0; i < 24; i++) {
+          await new Promise(r => setTimeout(r, 10000));
+
+          const statusRes = await fetch(`https://duelsapp.vercel.app/api/dub-status?id=${dubbingId}`);
           const statusData = await statusRes.json();
-    
+
           if (statusData.status === "dubbed") {
-    
             const elevenRes = await fetch(
               `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/audio/${langCode}`,
               { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY } }
             );
-    
+
             if (!elevenRes.ok) return;
-    
+
             const buffer = Buffer.from(await elevenRes.arrayBuffer());
-            const contentType =
-              elevenRes.headers.get("content-type") || "audio/mpeg";
-    
-            dubbedUrl = await uploadToS3(
-              buffer,
-              `multidub/${dubbingId}_${langCode}.mp3`,
-              contentType
-            );
-    
+            const contentType = elevenRes.headers.get("content-type") || "audio/mpeg";
+
+            dubbedUrl = await uploadToS3(buffer, `multidub/${dubbingId}_${langCode}.mp3`, contentType);
+
             const transcriptRes = await fetch(
               `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/transcripts/${langCode}/format/srt`,
-              {
-                headers: {
-                  "xi-api-key": process.env.ELEVENLABS_API_KEY
-                }
-              }
+              { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY } }
             );
-    
             if (transcriptRes.ok) {
               const srtText = await transcriptRes.text();
-    
               subtitleUrl = await uploadToS3(
                 Buffer.from(srtText, "utf-8"),
                 `subtitles/${dubbingId}_${langCode}.srt`,
                 "application/x-subrip"
               );
             }
-    
+
             break;
           }
-    
+
           if (statusData.status === "failed") break;
         }
-    
+
         if (dubbedUrl) {
-          results[langCode] = {
-            audio: dubbedUrl,
-            subtitles: subtitleUrl
-          };
+          results[langCode] = { audio: dubbedUrl, subtitles: subtitleUrl };
         }
-    
       })
     );
 
-    // FIX #5: Always deliver, never throw
     if (Object.keys(results).length === 0) {
-      await job.deliver({
+      await safeDeliver(job, {
         type: "object",
         value: {
           jobId: job.id.toString(),
@@ -747,7 +744,7 @@ async function processMultiDubbing(job) {
       return false;
     }
 
-    await job.deliver({
+    await safeDeliver(job, {
       type: "object",
       value: {
         jobId: job.id.toString(),
@@ -759,7 +756,7 @@ async function processMultiDubbing(job) {
 
   } catch (err) {
     console.error("Multi-dubbing error:", err);
-    await job.deliver({
+    await safeDeliver(job, {
       type: "object",
       value: {
         jobId: job.id.toString(),
@@ -774,7 +771,6 @@ async function processMultiDubbing(job) {
 
 /* -------------------------
    VOICEOVER LOGIC
-   FIX #5: Deliver failure on catch instead of throwing
 -------------------------- */
 
 async function processVoiceover(job) {
@@ -784,13 +780,9 @@ async function processVoiceover(job) {
   const voiceId = getVoiceId(voiceStyle);
 
   if (!text) {
-    await job.deliver({
+    await safeDeliver(job, {
       type: "object",
-      value: {
-        jobId: job.id.toString(),
-        status: "failed",
-        audio: ""
-      }
+      value: { jobId: job.id.toString(), status: "failed", audio: "" }
     });
     return false;
   }
@@ -804,15 +796,12 @@ async function processVoiceover(job) {
           "xi-api-key": process.env.ELEVENLABS_API_KEY,
           "Content-Type": "application/json"
         },
-        body: JSON.stringify({
-          text,
-          model_id: "eleven_multilingual_v2"
-        })
+        body: JSON.stringify({ text, model_id: "eleven_multilingual_v2" })
       }
     );
 
     if (!response.ok) {
-      await job.deliver({
+      await safeDeliver(job, {
         type: "object",
         value: {
           jobId: job.id.toString(),
@@ -825,22 +814,17 @@ async function processVoiceover(job) {
     }
 
     const buffer = Buffer.from(await response.arrayBuffer());
-    const key = `voiceover/${job.id}.mp3`;
-    const url = await uploadToS3(buffer, key, "audio/mpeg");
+    const url = await uploadToS3(buffer, `voiceover/${job.id}.mp3`, "audio/mpeg");
 
-    await job.deliver({
+    await safeDeliver(job, {
       type: "object",
-      value: {
-        jobId: job.id.toString(),
-        status: "completed",
-        audio: url
-      }
+      value: { jobId: job.id.toString(), status: "completed", audio: url }
     });
     return true;
 
   } catch (err) {
     console.error("Voiceover error:", err);
-    await job.deliver({
+    await safeDeliver(job, {
       type: "object",
       value: {
         jobId: job.id.toString(),
@@ -855,7 +839,6 @@ async function processVoiceover(job) {
 
 /* -------------------------
    MUSIC PRODUCTION LOGIC
-   FIX #5: Deliver failure on catch instead of throwing
 -------------------------- */
 
 async function processPremiumMusic(job) {
@@ -863,22 +846,15 @@ async function processPremiumMusic(job) {
     job.requirement || job.serviceRequirement || {};
 
   if (!concept || !genre || !mood || !vocalStyle || !duration) {
-    await job.deliver({
+    await safeDeliver(job, {
       type: "object",
-      value: {
-        jobId: job.id.toString(),
-        status: "failed",
-        audio: ""
-      }
+      value: { jobId: job.id.toString(), status: "failed", audio: "" }
     });
     return false;
   }
 
   try {
-    const durationMs = Math.max(
-      3000,
-      Math.min(280000, parseInt(duration) * 1000 || 60000)
-    );
+    const durationMs = Math.max(3000, Math.min(280000, parseInt(duration) * 1000 || 60000));
 
     const finalPrompt = `
 Create a professionally produced ${genre} track.
@@ -911,7 +887,7 @@ High quality production, radio-ready mix, cinematic depth, modern sound design.
     );
 
     if (!response.ok) {
-      await job.deliver({
+      await safeDeliver(job, {
         type: "object",
         value: {
           jobId: job.id.toString(),
@@ -924,22 +900,17 @@ High quality production, radio-ready mix, cinematic depth, modern sound design.
     }
 
     const buffer = Buffer.from(await response.arrayBuffer());
-    const key = `music/${job.id}.mp3`;
-    const url = await uploadToS3(buffer, key, "audio/mpeg");
+    const url = await uploadToS3(buffer, `music/${job.id}.mp3`, "audio/mpeg");
 
-    await job.deliver({
+    await safeDeliver(job, {
       type: "object",
-      value: {
-        jobId: job.id.toString(),
-        status: "completed",
-        audio: url
-      }
+      value: { jobId: job.id.toString(), status: "completed", audio: url }
     });
     return true;
 
   } catch (err) {
     console.error("Premium music error:", err);
-    await job.deliver({
+    await safeDeliver(job, {
       type: "object",
       value: {
         jobId: job.id.toString(),
@@ -954,8 +925,6 @@ High quality production, radio-ready mix, cinematic depth, modern sound design.
 
 /* -------------------------
    VOICE RECASTING LOGIC
-   Uses official ElevenLabs SDK with Blob.
-   FIX #5: Deliver failure on catch instead of throwing.
 -------------------------- */
 
 async function processVoiceRecast(job) {
@@ -965,13 +934,9 @@ async function processVoiceRecast(job) {
   const voiceId = getVoiceId(voiceStyle);
 
   if (!audioUrl) {
-    await job.deliver({
+    await safeDeliver(job, {
       type: "object",
-      value: {
-        jobId: job.id.toString(),
-        status: "failed",
-        audio: ""
-      }
+      value: { jobId: job.id.toString(), status: "failed", audio: "" }
     });
     return false;
   }
@@ -981,7 +946,7 @@ async function processVoiceRecast(job) {
 
     const sourceResponse = await fetch(audioUrl);
     if (!sourceResponse.ok) {
-      await job.deliver({
+      await safeDeliver(job, {
         type: "object",
         value: {
           jobId: job.id.toString(),
@@ -996,7 +961,7 @@ async function processVoiceRecast(job) {
     const audioBuffer = Buffer.from(await sourceResponse.arrayBuffer());
 
     if (audioBuffer.length > 25 * 1024 * 1024) {
-      await job.deliver({
+      await safeDeliver(job, {
         type: "object",
         value: {
           jobId: job.id.toString(),
@@ -1022,22 +987,17 @@ async function processVoiceRecast(job) {
     }
     const resultBuffer = Buffer.concat(chunks);
 
-    const key = `voicerecast/${job.id}.mp3`;
-    const url = await uploadToS3(resultBuffer, key, "audio/mpeg");
+    const url = await uploadToS3(resultBuffer, `voicerecast/${job.id}.mp3`, "audio/mpeg");
 
-    await job.deliver({
+    await safeDeliver(job, {
       type: "object",
-      value: {
-        jobId: job.id.toString(),
-        status: "completed",
-        audio: url
-      }
+      value: { jobId: job.id.toString(), status: "completed", audio: url }
     });
     return true;
 
   } catch (err) {
     console.error("Voice recast error:", err?.message || err);
-    await job.deliver({
+    await safeDeliver(job, {
       type: "object",
       value: {
         jobId: job.id.toString(),
@@ -1049,6 +1009,7 @@ async function processVoiceRecast(job) {
     return false;
   }
 }
+
 /* -------------------------
    ACP MAIN
 -------------------------- */
@@ -1064,16 +1025,13 @@ async function main() {
   });
 
   let acpContractClient;
-
   try {
     acpContractClient = await AcpContractClientV2.build(
       process.env.WHITELISTED_WALLET_PRIVATE_KEY,
       parseInt(process.env.SELLER_ENTITY_ID),
       process.env.SELLER_AGENT_WALLET_ADDRESS
     );
-
     console.log("AcpContractClient built successfully");
-
   } catch (err) {
     console.error("FATAL: AcpContractClientV2.build() failed:", err);
     process.exit(1);
@@ -1091,36 +1049,42 @@ async function main() {
       });
 
       if (!memoToSign) {
-        console.log("No memoToSign yet — skipping");
+        console.log("No memoToSign — skipping");
         return;
       }
 
       const phase = Number(memoToSign.nextPhase);
-
-      console.log("Processing phase:", phase, "job:", job.id, job.name);
 
       /* -------------------------
          PHASE 1 — ACCEPT / REJECT
       -------------------------- */
 
       if (phase === 1) {
-        try {
+        const jobId = job.id.toString();
 
+        if (processedPhase1.has(jobId)) {
+          console.log("Phase 1 already handled:", jobId);
+          return;
+        }
+        processedPhase1.add(jobId);
+
+        try {
           const req = job.requirement || job.serviceRequirement || {};
           const reason = validateRequirement(job.name, req);
 
           if (reason) {
-            console.log("Rejecting job:", job.id, reason);
-            await job.reject(reason);
+            console.log("Rejecting job:", jobId, reason);
+            await safeReject(job, reason);
+            console.log("Job rejected:", jobId);
             return;
           }
 
-          await job.respond(true);
+          await safeRespond(job);
 
-          // prevent ACP race condition
-          await new Promise(r => setTimeout(r, 50));
+          // Buffer for ACP race condition between respond → deliver
+          await new Promise(r => setTimeout(r, 500));
 
-          console.log("Job accepted:", job.id, job.name);
+          console.log("Job accepted:", jobId, job.name);
 
         } catch (err) {
           console.error("Phase 1 error:", err);
@@ -1134,72 +1098,53 @@ async function main() {
       -------------------------- */
 
       if (phase === 3) {
-
         const jobId = job.id.toString();
 
-        if (processedJobs.has(jobId)) {
-          console.log("Job already processed:", jobId);
+        if (processedPhase3.has(jobId)) {
+          console.log("Phase 3 already handled:", jobId);
           return;
         }
-
-        processedJobs.add(jobId);
+        processedPhase3.add(jobId);
 
         await enqueueJob(async () => {
-
           let delivered = false;
 
           try {
-
-            console.log("Processing job:", job.id, job.name);
+            console.log("Processing job:", jobId, job.name);
 
             if (job.name === "dubbing") {
               delivered = await processDubbing(job);
-            }
-
-            else if (job.name === "multidubbing") {
+            } else if (job.name === "multidubbing") {
               delivered = await processMultiDubbing(job);
-            }
-
-            else if (job.name === "musicproduction") {
+            } else if (job.name === "musicproduction") {
               delivered = await processPremiumMusic(job);
-            }
-
-            else if (job.name === "voiceover") {
+            } else if (job.name === "voiceover") {
               delivered = await processVoiceover(job);
-            }
-
-            else if (job.name === "voicerecast") {
+            } else if (job.name === "voicerecast") {
               delivered = await processVoiceRecast(job);
-            }
-
-            else {
+            } else {
               console.log("Unknown job type:", job.name);
             }
-
           } catch (err) {
             console.error("Processing error:", err);
           }
 
-          // absolute fallback to prevent expiration
+          // Absolute fallback — prevents job expiration
           if (!delivered) {
             try {
-
-              console.log("Fallback delivery triggered:", job.id);
-
-              await job.deliver({
+              console.log("Fallback delivery triggered:", jobId);
+              await safeDeliver(job, {
                 type: "object",
                 value: {
-                  jobId: job.id.toString(),
+                  jobId: jobId,
                   status: "failed",
                   reason: "Unhandled processing error"
                 }
               });
-
             } catch (err) {
               console.error("Fallback delivery failed:", err);
             }
           }
-
         });
 
         return;
@@ -1210,43 +1155,37 @@ async function main() {
       -------------------------- */
 
       if (phase === 4) {
-
         try {
-
           const success = job.result?.status === "completed";
 
           if (success) {
-            await job.evaluate(true, "Service completed successfully");
+            await safeEvaluate(job, true, "Service completed successfully");
             console.log("Escrow released:", job.id);
-          }
-
-          else {
-            await job.evaluate(false, "Service failed");
+          } else {
+            await safeEvaluate(job, false, "Service failed");
             console.log("Escrow refunded:", job.id);
           }
-
         } catch (err) {
           console.error("Evaluation error:", err);
         }
 
         return;
       }
-
     }
   });
 
   try {
-
     await acpClient.init();
-
     console.log("ACP agent initialized and listening");
-
   } catch (err) {
-
     console.error("FATAL: acpClient.init() failed:", err);
     process.exit(1);
-
   }
+
+  // Heartbeat — confirms listener is still alive
+  setInterval(() => {
+    console.log("ACP listener heartbeat", new Date().toISOString());
+  }, 30000);
 }
 
 main().catch(console.error);
