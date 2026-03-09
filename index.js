@@ -1049,7 +1049,6 @@ async function processVoiceRecast(job) {
     return false;
   }
 }
-
 /* -------------------------
    ACP MAIN
 -------------------------- */
@@ -1065,13 +1064,16 @@ async function main() {
   });
 
   let acpContractClient;
+
   try {
     acpContractClient = await AcpContractClientV2.build(
       process.env.WHITELISTED_WALLET_PRIVATE_KEY,
       parseInt(process.env.SELLER_ENTITY_ID),
       process.env.SELLER_AGENT_WALLET_ADDRESS
     );
+
     console.log("AcpContractClient built successfully");
+
   } catch (err) {
     console.error("FATAL: AcpContractClientV2.build() failed:", err);
     process.exit(1);
@@ -1082,58 +1084,108 @@ async function main() {
 
     onNewTask: async (job, memoToSign) => {
 
-      if (!memoToSign) return;
+      console.log("Incoming job:", {
+        id: job?.id,
+        name: job?.name,
+        phase: memoToSign?.nextPhase
+      });
 
-      console.log("Phase:", memoToSign.nextPhase, "Job:", job.id, job.name);
-
-      // --------------------
-      // Phase 1: Accept / Reject
-      // --------------------
-      if (memoToSign.nextPhase === 1) {
-        const req = job.requirement || job.serviceRequirement || {};
-        const reason = validateRequirement(job.name, req);
-
-        if (reason) {
-          console.log("Rejecting job:", job.id, reason);
-          return await job.reject(reason);
-        }
-
-        await job.respond(true);
-        console.log("Job accepted:", job.id, job.name);
+      if (!memoToSign) {
+        console.log("No memoToSign yet — skipping");
         return;
       }
 
-      // --------------------
-      // Phase 3: Process + Deliver
-      // --------------------
-      if (memoToSign.nextPhase === 3) {
-        if (processedJobs.has(job.id)) return;
-        processedJobs.add(job.id.toString());
+      const phase = Number(memoToSign.nextPhase);
+
+      console.log("Processing phase:", phase, "job:", job.id, job.name);
+
+      /* -------------------------
+         PHASE 1 — ACCEPT / REJECT
+      -------------------------- */
+
+      if (phase === 1) {
+        try {
+
+          const req = job.requirement || job.serviceRequirement || {};
+          const reason = validateRequirement(job.name, req);
+
+          if (reason) {
+            console.log("Rejecting job:", job.id, reason);
+            await job.reject(reason);
+            return;
+          }
+
+          await job.respond(true);
+
+          // prevent ACP race condition
+          await new Promise(r => setTimeout(r, 50));
+
+          console.log("Job accepted:", job.id, job.name);
+
+        } catch (err) {
+          console.error("Phase 1 error:", err);
+        }
+
+        return;
+      }
+
+      /* -------------------------
+         PHASE 3 — PROCESS + DELIVER
+      -------------------------- */
+
+      if (phase === 3) {
+
+        const jobId = job.id.toString();
+
+        if (processedJobs.has(jobId)) {
+          console.log("Job already processed:", jobId);
+          return;
+        }
+
+        processedJobs.add(jobId);
 
         await enqueueJob(async () => {
+
           let delivered = false;
 
           try {
+
+            console.log("Processing job:", job.id, job.name);
+
             if (job.name === "dubbing") {
               delivered = await processDubbing(job);
-            } else if (job.name === "multidubbing") {
-              delivered = await processMultiDubbing(job);
-            } else if (job.name === "musicproduction") {
-              delivered = await processPremiumMusic(job);
-            } else if (job.name === "voiceover") {
-              delivered = await processVoiceover(job);
-            } else if (job.name === "voicerecast") {
-              delivered = await processVoiceRecast(job);
-            } else {
-              console.log("Unknown job:", job.name);
             }
+
+            else if (job.name === "multidubbing") {
+              delivered = await processMultiDubbing(job);
+            }
+
+            else if (job.name === "musicproduction") {
+              delivered = await processPremiumMusic(job);
+            }
+
+            else if (job.name === "voiceover") {
+              delivered = await processVoiceover(job);
+            }
+
+            else if (job.name === "voicerecast") {
+              delivered = await processVoiceRecast(job);
+            }
+
+            else {
+              console.log("Unknown job type:", job.name);
+            }
+
           } catch (err) {
             console.error("Processing error:", err);
           }
 
-          // Last-resort delivery if something slipped through
+          // absolute fallback to prevent expiration
           if (!delivered) {
             try {
+
+              console.log("Fallback delivery triggered:", job.id);
+
               await job.deliver({
                 type: "object",
                 value: {
@@ -1142,44 +1194,58 @@ async function main() {
                   reason: "Unhandled processing error"
                 }
               });
-            } catch (e) {
-              console.error("Failed to deliver fallback result:", e);
+
+            } catch (err) {
+              console.error("Fallback delivery failed:", err);
             }
           }
+
         });
 
         return;
       }
 
-      // --------------------
-      // Phase 4: Evaluate (Release or Refund Escrow)
-      // --------------------
-      if (memoToSign.nextPhase === 4) {
+      /* -------------------------
+         PHASE 4 — EVALUATE
+      -------------------------- */
+
+      if (phase === 4) {
+
         try {
+
           const success = job.result?.status === "completed";
 
           if (success) {
             await job.evaluate(true, "Service completed successfully");
             console.log("Escrow released:", job.id);
-          } else {
+          }
+
+          else {
             await job.evaluate(false, "Service failed");
             console.log("Escrow refunded:", job.id);
           }
+
         } catch (err) {
           console.error("Evaluation error:", err);
         }
 
         return;
       }
+
     }
   });
 
   try {
+
     await acpClient.init();
+
     console.log("ACP agent initialized and listening");
+
   } catch (err) {
+
     console.error("FATAL: acpClient.init() failed:", err);
     process.exit(1);
+
   }
 }
 
