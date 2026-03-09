@@ -1055,11 +1055,27 @@ async function processVoiceRecast(job) {
 -------------------------- */
 
 async function main() {
-  const acpContractClient = await AcpContractClientV2.build(
-    process.env.WHITELISTED_WALLET_PRIVATE_KEY,
-    parseInt(process.env.SELLER_ENTITY_ID),
-    process.env.SELLER_AGENT_WALLET_ADDRESS
-  );
+  console.log("Starting... ENV check:", {
+    hasPrivKey: !!process.env.WHITELISTED_WALLET_PRIVATE_KEY,
+    entityId: process.env.SELLER_ENTITY_ID,
+    agentWallet: process.env.SELLER_AGENT_WALLET_ADDRESS,
+    hasElevenLabs: !!process.env.ELEVENLABS_API_KEY,
+    hasAwsRegion: !!process.env.AWS_REGION,
+    hasAwsBucket: !!process.env.AWS_S3_BUCKET,
+  });
+
+  let acpContractClient;
+  try {
+    acpContractClient = await AcpContractClientV2.build(
+      process.env.WHITELISTED_WALLET_PRIVATE_KEY,
+      parseInt(process.env.SELLER_ENTITY_ID),
+      process.env.SELLER_AGENT_WALLET_ADDRESS
+    );
+    console.log("AcpContractClient built successfully");
+  } catch (err) {
+    console.error("FATAL: AcpContractClientV2.build() failed:", err);
+    process.exit(1);
+  }
 
   const acpClient = new AcpClient({
     acpContractClient,
@@ -1072,7 +1088,6 @@ async function main() {
 
       // --------------------
       // Phase 1: Accept / Reject
-      // Synchronous — responds immediately
       // --------------------
       if (memoToSign.nextPhase === 1) {
         const req = job.requirement || job.serviceRequirement || {};
@@ -1090,9 +1105,6 @@ async function main() {
 
       // --------------------
       // Phase 3: Process + Deliver
-      // FIX #2: MAX_CONCURRENT_JOBS =  so evaluator jobs
-      // don't queue up and expire before starting.
-      // FIX #3: Fail-safe wrapper ensures delivery even on crash.
       // --------------------
       if (memoToSign.nextPhase === 3) {
         if (processedJobs.has(job.id)) return;
@@ -1119,7 +1131,7 @@ async function main() {
             console.error("Processing error:", err);
           }
 
-          // FIX #3: Last-resort delivery if something slipped through
+          // Last-resort delivery if something slipped through
           if (!delivered) {
             try {
               await job.deliver({
@@ -1162,8 +1174,13 @@ async function main() {
     }
   });
 
-  await acpClient.init();
-  console.log("ACP agent running...");
+  try {
+    await acpClient.init();
+    console.log("ACP agent initialized and listening");
+  } catch (err) {
+    console.error("FATAL: acpClient.init() failed:", err);
+    process.exit(1);
+  }
 }
 
 main().catch(console.error);
