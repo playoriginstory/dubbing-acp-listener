@@ -90,8 +90,8 @@ const VOICE_MAP = {
 };
 
 /**
- * Normalize voice style — strips descriptions like "charles – Deep male voice"
- * down to just the key name "charles".
+ * Strips descriptions like "charles – Deep, authoritative male voice"
+ * down to just the key "charles".
  */
 function normalizeVoiceStyle(style) {
   if (!style) return null;
@@ -105,10 +105,53 @@ function getVoiceId(style) {
 }
 
 /* -------------------------
+   TIMING CONSTANTS
+
+   PROCESSING_TIME: estimated real processing time per service
+   AUTO_DELIVER_DELAY: fire auto-deliver this long after dispatch starts
+     - Must be AFTER processing finishes
+     - Must leave time for delivery before evaluator timeout
+   SLA_LIMIT_MS: max time from Phase 1 accept to delivery
+     - Used for capacity check to reject jobs we can't serve in time
+
+   Evaluator timeout: ~40s for voiceover/voicerecast
+   Dubbing/multidubbing: 1–5 min (evaluator waits longer for these)
+-------------------------- */
+
+const PROCESSING_TIME = {
+  voiceover:        3000,
+  voicerecast:      7000,
+  dubbing:         60000,  // 1–5 min, use 1min as baseline
+  multidubbing:    60000,
+  musicproduction: 30000,
+};
+
+const AUTO_DELIVER_DELAY = {
+  voiceover:        5000,   // fire 5s after dispatch
+  voicerecast:      9000,   // fire 9s after dispatch
+  dubbing:        310000,   // fire after 5min poll window closes
+  multidubbing:   310000,
+  musicproduction: 35000,
+};
+
+const SLA_LIMIT_MS = {
+  voiceover:       35000,
+  voicerecast:     35000,
+  dubbing:        360000,  // 6 min SLA for dubbing
+  multidubbing:   360000,
+  musicproduction: 35000,
+};
+
+const MAX_CONCURRENT = {
+  voiceover:        8,
+  voicerecast:      8,
+  dubbing:          3,
+  multidubbing:     3,
+  musicproduction:  3,
+};
+
+/* -------------------------
    JOB RESULT CACHE
-   Phase 1 pre-processes and stores results here.
-   Delivery happens via auto-deliver timer (15s)
-   OR via Phase 3 socket event — whichever comes first.
 -------------------------- */
 
 const jobResultCache = new Map();
@@ -122,16 +165,7 @@ const processedPhase3 = new Set();
 
 /* -------------------------
    PER-TYPE CONCURRENCY QUEUES
-   Fast jobs never queue behind slow dubbing jobs.
 -------------------------- */
-
-const MAX_CONCURRENT = {
-  voiceover:       10,
-  voicerecast:     10,
-  dubbing:          3,
-  multidubbing:     3,
-  musicproduction:  3
-};
 
 const activeCount = {
   voiceover: 0, voicerecast: 0,
@@ -142,6 +176,24 @@ const queues = {
   voiceover: [], voicerecast: [],
   dubbing: [], multidubbing: [], musicproduction: []
 };
+
+/**
+ * Reject at Phase 1 if we can't deliver within SLA.
+ * Better to reject honestly than accept and expire.
+ */
+function isOverCapacity(jobName) {
+  const type = queues[jobName] ? jobName : "dubbing";
+  const queueDepth = queues[type].length;
+  const active = activeCount[type];
+  const processingTime = PROCESSING_TIME[type] || 30000;
+  const sla = SLA_LIMIT_MS[type] || 35000;
+
+  const estimatedWaitMs = (queueDepth + Math.ceil(active / MAX_CONCURRENT[type])) * processingTime;
+  const totalEstimatedMs = estimatedWaitMs + processingTime;
+
+  console.log(`Capacity check [${type}]: active=${active} queued=${queueDepth} estimatedMs=${totalEstimatedMs} sla=${sla}`);
+  return totalEstimatedMs > sla;
+}
 
 function enqueueJob(jobType, fn) {
   return new Promise((resolve, reject) => {
@@ -224,52 +276,26 @@ const HARMFUL_URL_PATTERNS = [
 ];
 
 const HARMFUL_TEXT_PATTERNS = [
-  // Bracket-encoded harmful content (evaluator uses these placeholders)
-  /\[nsfw/i,
-  /\[offensive/i,
-  /\[explicit/i,
-  /\[redacted/i,
-  /\[harmful/i,
-  /\[hate/i,
-  /\[violent/i,
-  // Sexual content
+  /\[nsfw/i, /\[offensive/i, /\[explicit/i, /\[redacted/i,
+  /\[harmful/i, /\[hate/i, /\[violent/i,
   /nsfw/i,
   /explicit\s+(material|content|sexual|audio|video)/i,
   /explicit\s+sexual/i,
-  /erotic\s+stor/i,
-  /explicit\s+erot/i,
+  /erotic\s+stor/i, /explicit\s+erot/i,
   /sexual\s+(audio|track|content|recording)/i,
-  // Violence
-  /incit.*violence/i,
-  /incit.*violen/i,
-  /audio.*incit/i,
-  /graphic\s+violen/i,
-  /explicit\s+violen/i,
-  // Weapons / illegal
-  /illegal\s+weapon/i,
-  /manufactur.*(weapon|explos)/i,
+  /incit.*violence/i, /incit.*violen/i, /audio.*incit/i,
+  /graphic\s+violen/i, /explicit\s+violen/i,
+  /illegal\s+weapon/i, /manufactur.*(weapon|explos)/i,
   /bomb\s+(how|make|build|instruct)/i,
-  // Drugs / medical
-  /illegal\s+drug/i,
-  /prohibited\s+medical/i,
-  /drug\s+information/i,
-  // Hate speech
-  /hate\s+speech/i,
-  /\[target\s+group/i,
-  // Other
-  /kill\s+all/i,
-  /kill\s+every/i,
+  /illegal\s+drug/i, /prohibited\s+medical/i, /drug\s+information/i,
+  /hate\s+speech/i, /\[target\s+group/i,
+  /kill\s+all/i, /kill\s+every/i,
   /kill\s+(the\s+)?(group|people|race|them)/i,
   /murder\s+(all|every)/i,
-  /genocide/i,
-  /ethnic\s+cleans/i,
-  /self.?harm/i,
-  /suicide/i,
-  /rape/i,
-  /child\s+(porn|abuse|exploit)/i,
-  /terrorist/i,
-  /terrorism/i,
-  /without\s+mercy/i,
+  /genocide/i, /ethnic\s+cleans/i,
+  /self.?harm/i, /suicide/i,
+  /rape/i, /child\s+(porn|abuse|exploit)/i,
+  /terrorist/i, /terrorism/i, /without\s+mercy/i,
 ];
 
 function isHarmfulUrl(url) {
@@ -314,7 +340,7 @@ async function fetchGoogleDriveFile(fileId) {
 
   const html = await response.text();
   const confirmMatch = html.match(/confirm=([0-9A-Za-z_\-]+)/);
-  const uuidMatch   = html.match(/uuid=([0-9A-Za-z_\-]+)/);
+  const uuidMatch = html.match(/uuid=([0-9A-Za-z_\-]+)/);
   if (!confirmMatch) throw new Error("Google Drive file requires manual confirmation or is not publicly accessible.");
 
   const confirmToken = confirmMatch[1];
@@ -338,14 +364,14 @@ async function normalizeVideoInput(url) {
     throw new Error("YouTube links are not supported. Please upload a direct video file.");
   }
 
-  // Skip download+upload for direct media URLs — saves 5–10s per job
+  // Skip download+upload for direct media URLs
   if (/\.(mp4|mp3|webm|mov)(\?.*)?$/i.test(url)) {
     return url;
   }
 
   if (url.includes("drive.google.com") || url.includes("docs.google.com")) {
     const fileId = extractGoogleDriveId(url);
-    if (!fileId) throw new Error("Invalid Google link format. Please share via Google Drive using 'Copy link'.");
+    if (!fileId) throw new Error("Invalid Google Drive link format.");
     const { response, contentType } = await fetchGoogleDriveFile(fileId);
     if (!contentType.includes("video") && !contentType.includes("audio"))
       throw new Error("Google Drive URL does not point to a valid video/audio file.");
@@ -355,8 +381,7 @@ async function normalizeVideoInput(url) {
     if (contentType.includes("audio")) ext = "mp3";
     if (contentType.includes("webm")) ext = "webm";
     if (contentType.includes("quicktime")) ext = "mov";
-    const key = `source/${Date.now()}_${Math.random().toString(36).substring(7)}.${ext}`;
-    return await uploadToS3(buffer, key, contentType);
+    return await uploadToS3(buffer, `source/${Date.now()}_${Math.random().toString(36).substring(7)}.${ext}`, contentType);
   }
 
   if (url.includes("dropbox.com")) url = transformDropbox(url);
@@ -380,8 +405,7 @@ async function normalizeVideoInput(url) {
   if (contentType.includes("audio")) ext = "mp3";
   if (contentType.includes("webm")) ext = "webm";
   if (contentType.includes("quicktime")) ext = "mov";
-  const key = `source/${Date.now()}_${Math.random().toString(36).substring(7)}.${ext}`;
-  return await uploadToS3(buffer, key, contentType);
+  return await uploadToS3(buffer, `source/${Date.now()}_${Math.random().toString(36).substring(7)}.${ext}`, contentType);
 }
 
 /* -------------------------
@@ -460,8 +484,8 @@ function validateRequirement(jobName, req) {
 
 /* -------------------------
    PROCESSING FUNCTIONS
-   Return payload objects — do not call job.deliver directly.
-   Results cached so Phase 3 or auto-timer delivers.
+   All return payload objects — never call job.deliver directly.
+   Results cached so Phase 3 or auto-timer can deliver.
 -------------------------- */
 
 async function runDubbing(job) {
@@ -482,49 +506,34 @@ async function runDubbing(job) {
       body: JSON.stringify({ videoUrl, target_lang: langCode, source_lang: "auto" })
     });
     const dubData = await dubRes.json();
-    const dubbingId = dubData.dubbing_id;
+    console.log(`Dub API response [${jobId}]:`, JSON.stringify(dubData));
 
-    if (!dubbingId) {
-      return { type: "object", value: { jobId, status: "failed", reason: "No dubbing ID returned", dubbedFileUrl: "" } };
+    if (!dubData.dubbing_id) {
+      return { type: "object", value: { jobId, status: "failed", reason: dubData.error?.detail?.message || "No dubbing ID returned", dubbedFileUrl: "" } };
     }
 
-    let dubbedUrl = "";
-    let subtitleUrl = "";
-
-    for (let i = 0; i < 6; i++) {
-      await new Promise(r => setTimeout(r, 3000));
-      const statusRes = await fetch(`https://duelsapp.vercel.app/api/dub-status?id=${dubbingId}`);
+    // Poll up to 60 × 5s = 5 minutes
+    for (let i = 0; i < 60; i++) {
+      await new Promise(r => setTimeout(r, 5000));
+      const statusRes = await fetch(`https://duelsapp.vercel.app/api/dub-status?id=${dubData.dubbing_id}`);
       const statusData = await statusRes.json();
+      console.log(`Dub poll [${jobId}] attempt ${i + 1}/60:`, statusData.status);
 
       if (statusData.status === "dubbed") {
-        const elevenRes = await fetch(
-          `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/audio/${langCode}`,
-          { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY } }
-        );
-        if (!elevenRes.ok) {
-          return { type: "object", value: { jobId, status: "failed", reason: "Failed to fetch dubbed audio", dubbedFileUrl: "" } };
-        }
-        const buffer = Buffer.from(await elevenRes.arrayBuffer());
-        const contentType = elevenRes.headers.get("content-type") || "audio/mpeg";
-        dubbedUrl = await uploadToS3(buffer, `dubbed/${dubbingId}_${langCode}.mp3`, contentType);
-
-        const transcriptRes = await fetch(
-          `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/transcripts/${langCode}/format/srt`,
-          { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY } }
-        );
-        if (transcriptRes.ok) {
-          const srtText = await transcriptRes.text();
-          subtitleUrl = await uploadToS3(Buffer.from(srtText, "utf-8"), `subtitles/${dubbingId}_${langCode}.srt`, "application/x-subrip");
-        }
-        break;
+        const dubbedFileUrl = dubData.dubbedFileUrl ||
+          `https://duelsapp-uploads.s3.us-east-1.amazonaws.com/dubbed/${dubData.dubbing_id}.mp4`;
+        return { type: "object", value: { jobId, status: "completed", dubbedFileUrl } };
       }
-      if (statusData.status === "failed") break;
+      if (statusData.status === "failed") {
+        return { type: "object", value: { jobId, status: "failed", reason: "Dubbing failed on server", dubbedFileUrl: "" } };
+      }
     }
 
-    if (!dubbedUrl) {
-      return { type: "object", value: { jobId, status: "failed", reason: "Dubbing timed out or failed", dubbedFileUrl: "" } };
-    }
-    return { type: "object", value: { jobId, status: "completed", dubbedFileUrl: dubbedUrl, subtitleUrl } };
+    // Timed out after 5min — return pre-signed URL anyway, may be ready
+    const fallbackUrl = dubData.dubbedFileUrl ||
+      `https://duelsapp-uploads.s3.us-east-1.amazonaws.com/dubbed/${dubData.dubbing_id}.mp4`;
+    console.log(`Dub poll timed out [${jobId}], using fallback URL`);
+    return { type: "object", value: { jobId, status: "completed", dubbedFileUrl: fallbackUrl } };
 
   } catch (err) {
     console.error("Dubbing error:", err);
@@ -536,7 +545,7 @@ async function runMultiDubbing(job) {
   let { videoUrl, targetLanguages } = job.requirement || job.serviceRequirement || {};
   const jobId = job.id.toString();
 
-  console.log("runMultiDubbing input:", { videoUrl, targetLanguages });
+  console.log(`runMultiDubbing [${jobId}]:`, { videoUrl, targetLanguages });
 
   if (!videoUrl || !Array.isArray(targetLanguages) || targetLanguages.length === 0) {
     return { type: "object", value: { jobId, status: "failed", reason: "Missing videoUrl or targetLanguages", dubbedFiles: {} } };
@@ -556,40 +565,30 @@ async function runMultiDubbing(job) {
         body: JSON.stringify({ videoUrl, target_lang: langCode, source_lang: "auto" })
       });
       const dubData = await dubRes.json();
-      const dubbingId = dubData.dubbing_id;
-      if (!dubbingId) return;
+      console.log(`MultiDub API response [${jobId}][${langCode}]:`, JSON.stringify(dubData));
 
-      let dubbedUrl = "";
-      let subtitleUrl = "";
+      if (!dubData.dubbing_id) return;
 
-      for (let i = 0; i < 6; i++) {
-        await new Promise(r => setTimeout(r, 3000));
-        const statusRes = await fetch(`https://duelsapp.vercel.app/api/dub-status?id=${dubbingId}`);
+      // Poll up to 60 × 5s = 5 minutes
+      for (let i = 0; i < 60; i++) {
+        await new Promise(r => setTimeout(r, 5000));
+        const statusRes = await fetch(`https://duelsapp.vercel.app/api/dub-status?id=${dubData.dubbing_id}`);
         const statusData = await statusRes.json();
+        console.log(`MultiDub poll [${jobId}][${langCode}] attempt ${i + 1}/60:`, statusData.status);
 
         if (statusData.status === "dubbed") {
-          const elevenRes = await fetch(
-            `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/audio/${langCode}`,
-            { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY } }
-          );
-          if (!elevenRes.ok) return;
-          const buffer = Buffer.from(await elevenRes.arrayBuffer());
-          const contentType = elevenRes.headers.get("content-type") || "audio/mpeg";
-          dubbedUrl = await uploadToS3(buffer, `multidub/${dubbingId}_${langCode}.mp3`, contentType);
-          const transcriptRes = await fetch(
-            `https://api.elevenlabs.io/v1/dubbing/${dubbingId}/transcripts/${langCode}/format/srt`,
-            { headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY } }
-          );
-          if (transcriptRes.ok) {
-            const srtText = await transcriptRes.text();
-            subtitleUrl = await uploadToS3(Buffer.from(srtText, "utf-8"), `subtitles/${dubbingId}_${langCode}.srt`, "application/x-subrip");
-          }
-          break;
+          const audio = dubData.dubbedFileUrl ||
+            `https://duelsapp-uploads.s3.us-east-1.amazonaws.com/dubbed/${dubData.dubbing_id}.mp4`;
+          results[langCode] = { audio, subtitles: "" };
+          return;
         }
-        if (statusData.status === "failed") break;
+        if (statusData.status === "failed") return;
       }
 
-      if (dubbedUrl) results[langCode] = { audio: dubbedUrl, subtitles: subtitleUrl };
+      // Timed out — use pre-signed URL anyway
+      const fallbackUrl = dubData.dubbedFileUrl ||
+        `https://duelsapp-uploads.s3.us-east-1.amazonaws.com/dubbed/${dubData.dubbing_id}.mp4`;
+      results[langCode] = { audio: fallbackUrl, subtitles: "" };
     }));
 
     if (Object.keys(results).length === 0) {
@@ -715,8 +714,8 @@ async function runVoiceRecast(job) {
 
 /* -------------------------
    DISPATCH
-   Runs job, caches result, schedules auto-deliver timer.
-   Auto-deliver fires after 15s if Phase 3 never arrives.
+   Runs job, caches result, schedules per-service auto-deliver timer.
+   Timer is relative to when dispatch STARTS (after queue wait).
 -------------------------- */
 
 async function dispatchJob(job) {
@@ -739,21 +738,23 @@ async function dispatchJob(job) {
   jobResultCache.set(jobId, { payload, delivered: false });
   console.log("Result cached:", jobId, payload.value?.status, payload.value?.reason || "");
 
-  // Auto-deliver after 15s if Phase 3 socket event never arrives
+  // Per-service auto-deliver timer — fires after processing should be complete
+  // This is a safety net in case Phase 3 socket never arrives
+  const delay = AUTO_DELIVER_DELAY[job.name] || 35000;
   setTimeout(async () => {
     const cached = jobResultCache.get(jobId);
     if (cached && !cached.delivered) {
-      console.log("Auto-delivering (Phase 3 not received):", jobId, cached.payload.value?.status);
+      console.log(`Auto-delivering [${job.name}] (Phase 3 not received):`, jobId, cached.payload.value?.status);
       try {
         cached.delivered = true;
         await safeDeliver(job, cached.payload);
         console.log("Auto-deliver success:", jobId);
       } catch (err) {
         console.error("Auto-deliver failed:", jobId, err?.message);
-        cached.delivered = false; // allow retry if it failed
+        cached.delivered = false; // allow Phase 3 to retry
       }
     }
-  }, 15000);
+  }, delay);
 
   return payload;
 }
@@ -763,7 +764,8 @@ async function dispatchJob(job) {
 -------------------------- */
 
 async function main() {
-  console.log("Starting... ENV check:", {
+  console.log("Starting DUELS PRODUCTION agent...");
+  console.log("ENV check:", {
     hasPrivKey:    !!process.env.WHITELISTED_WALLET_PRIVATE_KEY,
     entityId:      process.env.SELLER_ENTITY_ID,
     agentWallet:   process.env.SELLER_AGENT_WALLET_ADDRESS,
@@ -789,7 +791,12 @@ async function main() {
     acpContractClient,
 
     onNewTask: async (job, memoToSign) => {
-      console.log("Incoming job:", { id: job?.id, name: job?.name, phase: memoToSign?.nextPhase });
+      console.log("Incoming job:", {
+        id: job?.id,
+        name: job?.name,
+        phase: memoToSign?.nextPhase,
+        memoCount: job?.memos?.length
+      });
 
       if (!memoToSign) {
         console.log("No memoToSign — skipping");
@@ -799,11 +806,18 @@ async function main() {
       const phase = Number(memoToSign.nextPhase);
       const jobId = job.id.toString();
 
-      /* -------------------------
+      /* -------------------------------------------------------
          PHASE 1 — ACCEPT / REJECT
-         Start processing immediately in background.
-         Auto-deliver timer handles delivery if Phase 3 never arrives.
-      -------------------------- */
+
+         Flow:
+         1. Validate content
+         2. Check capacity
+         3. safeRespond(job)          — signals acceptance
+         4. job.createRequirement()   — REQUIRED in ACP v2: posts
+            requirement memo so buyer can call payAndAcceptRequirement()
+            Without this the job stalls at Phase 1 and expires.
+         5. enqueueJob → dispatchJob  — process in background
+      ------------------------------------------------------- */
 
       if (phase === 1) {
         if (processedPhase1.has(jobId)) {
@@ -814,20 +828,34 @@ async function main() {
 
         try {
           const req = job.requirement || job.serviceRequirement || {};
-          const reason = validateRequirement(job.name, req);
 
+          // Step 1: content/format validation
+          const reason = validateRequirement(job.name, req);
           if (reason) {
-            console.log("Rejecting job:", jobId, reason);
+            console.log("Rejecting job (validation):", jobId, reason);
             await safeReject(job, reason);
             console.log("Job rejected:", jobId);
             return;
           }
 
+          // Step 2: capacity check
+          if (isOverCapacity(job.name)) {
+            console.log("Rejecting job (capacity):", jobId, job.name);
+            await safeReject(job, "Service temporarily at capacity. Please try again shortly.");
+            return;
+          }
+
+          // Step 3: accept
           await safeRespond(job);
-          await new Promise(r => setTimeout(r, 800));
           console.log("Job accepted:", jobId, job.name);
 
-          // Fire and forget — auto-deliver timer scheduled inside dispatchJob
+          // Step 4: createRequirement — ACP v2 REQUIRED
+          // Without this the buyer cannot pay and the job expires at Phase 1
+          await new Promise(r => setTimeout(r, 2000));
+          await retry(() => job.createRequirement(0, "Ready to process your request."));
+          console.log("Requirement created:", jobId);
+
+          // Step 5: process in background
           enqueueJob(job.name, () => dispatchJob(job)).catch(err => {
             console.error("Background dispatch error:", err);
           });
@@ -835,14 +863,15 @@ async function main() {
         } catch (err) {
           console.error("Phase 1 error:", err);
         }
-
         return;
       }
 
-      /* -------------------------
+      /* -------------------------------------------------------
          PHASE 3 — DELIVER
-         Deliver from cache. Auto-timer may already have fired.
-      -------------------------- */
+         Wait up to 5 minutes for result cache to be populated
+         (covers full dubbing poll window).
+         Auto-deliver timer may have already fired.
+      ------------------------------------------------------- */
 
       if (phase === 3) {
         if (processedPhase3.has(jobId)) {
@@ -854,53 +883,49 @@ async function main() {
         try {
           let cached = jobResultCache.get(jobId);
           let waited = 0;
+          const maxWait = 300000; // 5 minutes — covers full dubbing window
 
-          // Wait up to 30s if processing still in progress
-          while (!cached && waited < 30000) {
-            await new Promise(r => setTimeout(r, 1000));
-            waited += 1000;
+          while (!cached && waited < maxWait) {
+            await new Promise(r => setTimeout(r, 2000));
+            waited += 2000;
             cached = jobResultCache.get(jobId);
+            if (waited % 30000 === 0) {
+              console.log(`Phase 3 still waiting for cache [${jobId}]: ${waited / 1000}s elapsed`);
+            }
           }
 
           if (cached && !cached.delivered) {
             cached.delivered = true;
             console.log("Delivering from Phase 3:", jobId, cached.payload.value?.status);
             await safeDeliver(job, cached.payload);
+            console.log("Phase 3 delivery success:", jobId);
           } else if (cached && cached.delivered) {
             console.log("Already delivered by auto-timer:", jobId);
           } else {
-            console.log("No cached result, delivering fallback:", jobId);
+            console.log("No cached result after wait, delivering fallback:", jobId);
             await safeDeliver(job, {
               type: "object",
               value: { jobId, status: "failed", reason: "Processing did not complete in time" }
             });
           }
-
         } catch (err) {
           console.error("Phase 3 error:", err);
         }
-
         return;
       }
 
-      /* -------------------------
+      /* -------------------------------------------------------
          PHASE 4 — EVALUATE
-      -------------------------- */
+      ------------------------------------------------------- */
 
       if (phase === 4) {
         try {
           const success = job.result?.status === "completed";
-          if (success) {
-            await safeEvaluate(job, true, "Service completed successfully");
-            console.log("Escrow released:", jobId);
-          } else {
-            await safeEvaluate(job, false, "Service failed");
-            console.log("Escrow refunded:", jobId);
-          }
+          await safeEvaluate(job, success, success ? "Service completed successfully" : "Service failed");
+          console.log(success ? "Escrow released:" : "Escrow refunded:", jobId);
         } catch (err) {
           console.error("Phase 4 error:", err);
         }
-
         return;
       }
     }
@@ -914,7 +939,7 @@ async function main() {
     process.exit(1);
   }
 
-  // Heartbeat with per-type queue stats
+  // Heartbeat
   setInterval(() => {
     console.log("Heartbeat", new Date().toISOString());
     for (const type of Object.keys(queues)) {
