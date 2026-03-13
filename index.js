@@ -758,10 +758,6 @@ async function dispatchJob(job) {
    ACP MAIN
 -------------------------- */
 
-/* -------------------------
-   ACP MAIN
--------------------------- */
-
 async function main() {
   console.log("Starting DUELS PRODUCTION agent...");
   console.log("ENV check:", {
@@ -773,64 +769,22 @@ async function main() {
     hasAwsBucket:  !!process.env.AWS_S3_BUCKET,
   });
 
-  /* -------------------------
-     BUILD CLIENT WITH RETRY
-  -------------------------- */
-
-  async function buildClientWithRetry() {
-    let attempts = 0;
-
-    while (attempts < 5) {
-      try {
-        console.log(`Building ACP client attempt ${attempts + 1}`);
-
-        const client = await AcpContractClientV2.build(
-          process.env.WHITELISTED_WALLET_PRIVATE_KEY,
-          parseInt(process.env.SELLER_ENTITY_ID),
-          process.env.SELLER_AGENT_WALLET_ADDRESS
-        );
-
-        console.log("AcpContractClient built successfully");
-        return client;
-
-      } catch (err) {
-        attempts++;
-
-        console.log(
-          "ACP build retry:",
-          err?.shortMessage || err?.message
-        );
-
-        if (attempts >= 5) throw err;
-
-        await new Promise(r => setTimeout(r, 5000));
-      }
-    }
-  }
-
-  /* -------------------------
-     INITIALIZE ACP CLIENT
-  -------------------------- */
-
   let acpContractClient;
-
   try {
-    console.log("Waiting for RPC warmup...");
-    await new Promise(r => setTimeout(r, 3000));
-
-    acpContractClient = await buildClientWithRetry();
-
+    acpContractClient = await AcpContractClientV2.build(
+      process.env.WHITELISTED_WALLET_PRIVATE_KEY,
+      parseInt(process.env.SELLER_ENTITY_ID),
+      process.env.SELLER_AGENT_WALLET_ADDRESS
+    );
+    console.log("AcpContractClient built successfully");
   } catch (err) {
-    console.error("FATAL: ACP client failed to build:", err);
+    console.error("FATAL: AcpContractClientV2.build() failed:", err);
     process.exit(1);
   }
 
-  /* -------------------------
-     CREATE ACP CLIENT
-  -------------------------- */
-
   const acpClient = new AcpClient({
     acpContractClient,
+
     /* -------------------------------------------------------
        onNewTask — handles Phase 1 (accept) and Phase 3 (deliver)
     ------------------------------------------------------- */
@@ -903,81 +857,38 @@ async function main() {
           return;
         }
         processedPhase3.add(jobId);
-      
+
         try {
           let cached = jobResultCache.get(jobId);
           let waited = 0;
           const maxWait = 450000; // 7.5 minutes
-      
+
           while (!cached && waited < maxWait) {
             await new Promise(r => setTimeout(r, 2000));
             waited += 2000;
             cached = jobResultCache.get(jobId);
-      
             if (waited % 30000 === 0) {
               console.log(`Phase 3 still waiting for cache [${jobId}]: ${waited / 1000}s elapsed`);
             }
           }
-      
+
           if (cached && !cached.delivered) {
             cached.delivered = true;
-      
             console.log("Delivering from Phase 3:", jobId, cached.payload.value);
-      
             await safeDeliver(job, cached.payload);
-      
             console.log("Phase 3 delivery success:", jobId);
-      
-            /* -------------------------
-               FALLBACK AUTO-EVALUATION
-               prevents jobs stuck at phase 3
-            -------------------------- */
-      
-            setTimeout(async () => {
-              try {
-                if (processedEvaluate.has(jobId)) {
-                  console.log("Evaluation already handled:", jobId);
-                  return;
-                }
-      
-                const success = cached.payload?.value?.status === "completed";
-      
-                console.log("Attempting fallback evaluation:", jobId);
-      
-                await safeEvaluate(
-                  job,
-                  success,
-                  success
-                    ? "Auto-evaluated: service completed"
-                    : "Auto-evaluated: service failed"
-                );
-      
-                processedEvaluate.add(jobId);
-      
-                console.log("Fallback evaluation complete:", jobId);
-              } catch (err) {
-                console.log("Fallback evaluation skipped (not evaluator wallet):", jobId);
-              }
-            }, 120000); // wait 2 minutes
-          }
-      
-          else if (cached && cached.delivered) {
+          } else if (cached && cached.delivered) {
             console.log("Already delivered by auto-timer:", jobId);
-          }
-      
-          else {
+          } else {
             console.log("No cached result after wait, delivering fallback:", jobId);
-      
             await safeDeliver(job, {
               type: "url",
               value: "error: Processing did not complete in time"
             });
           }
-      
         } catch (err) {
           console.error("Phase 3 error:", err);
         }
-      
         return;
       }
     },
