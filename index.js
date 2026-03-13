@@ -89,10 +89,6 @@ const VOICE_MAP = {
   alice:   "Xb7hH8MSUJpSbSDYk0k2"
 };
 
-/**
- * Strips descriptions like "charles – Deep, authoritative male voice"
- * down to just the key "charles".
- */
 function normalizeVoiceStyle(style) {
   if (!style) return null;
   return String(style).split(/\s*[–—\-]\s*/)[0].trim().toLowerCase();
@@ -127,7 +123,7 @@ const AUTO_DELIVER_DELAY = {
 const SLA_LIMIT_MS = {
   voiceover:       35000,
   voicerecast:     35000,
-  dubbing:        480000,   // 8 min SLA
+  dubbing:        480000,
   multidubbing:   480000,
   musicproduction: 35000,
 };
@@ -173,10 +169,8 @@ function isOverCapacity(jobName) {
   const active = activeCount[type];
   const processingTime = PROCESSING_TIME[type] || 30000;
   const sla = SLA_LIMIT_MS[type] || 35000;
-
   const estimatedWaitMs = (queueDepth + Math.ceil(active / MAX_CONCURRENT[type])) * processingTime;
   const totalEstimatedMs = estimatedWaitMs + processingTime;
-
   console.log(`Capacity check [${type}]: active=${active} queued=${queueDepth} estimatedMs=${totalEstimatedMs} sla=${sla}`);
   return totalEstimatedMs > sla;
 }
@@ -267,10 +261,6 @@ const HARMFUL_TEXT_PATTERNS = [
   /nsfw/i,
   /explicit\s+(material|content|sexual|audio|video)/i,
   /explicit\s+sexual/i,
-  /sexually\s+explicit/i,
-  /adult\s+(content|description|material|audio|video)/i,
-  /adult\s+and\s+explicit/i,
-  /explicit\s+and\s+adult/i,
   /erotic\s+stor/i, /explicit\s+erot/i,
   /sexual\s+(audio|track|content|recording)/i,
   /incit.*violence/i, /incit.*violen/i, /audio.*incit/i,
@@ -354,7 +344,6 @@ async function normalizeVideoInput(url) {
     throw new Error("YouTube links are not supported. Please upload a direct video file.");
   }
 
-  // Skip download+upload for direct media URLs
   if (/\.(mp4|mp3|webm|mov)(\?.*)?$/i.test(url)) {
     return url;
   }
@@ -473,77 +462,75 @@ function validateRequirement(jobName, req) {
 }
 
 /* -------------------------
-   ELEVENLABS DUBBING HELPERS
-   Direct SDK calls — no Vercel proxy dependency.
+   ELEVENLABS DUBBING — raw fetch, no SDK
+   Identical logic to the graduation-passing version,
+   just pointing at api.elevenlabs.io instead of the Vercel proxy.
 -------------------------- */
 
-/**
- * Starts a dubbing job via the ElevenLabs SDK (v2.30+).
- * client.dubbing.create() with a single target_lang string.
- * Returns the dubbing_id string.
- */
-async function startElevenLabsDub(videoUrl, langCode) {
-  const response = await elevenlabs.dubbing.create({
-    source_url: videoUrl,       // public S3 URL produced by normalizeVideoInput
-    target_lang: langCode,      // single language code string e.g. "zh", "es"
-    source_lang: "auto",
-    mode: "automatic",
-    num_speakers: 0,            // 0 = auto-detect
-    watermark: false,
+async function startDub(videoUrl, langCode, jobId) {
+  const formData = new FormData();
+  formData.append("source_url", videoUrl);
+  formData.append("target_lang", langCode);
+  formData.append("source_lang", "auto");
+  formData.append("mode", "automatic");
+  formData.append("num_speakers", "0");
+  formData.append("watermark", "false");
+
+  const res = await fetch("https://api.elevenlabs.io/v1/dubbing", {
+    method: "POST",
+    headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY },
+    body: formData
   });
 
-  if (!response.dubbing_id) {
-    throw new Error("ElevenLabs dubbing did not return a dubbing_id");
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`ElevenLabs dub start failed [${jobId}][${langCode}] HTTP ${res.status}: ${errText.slice(0, 300)}`);
   }
 
-  console.log(`Dubbing job created: id=${response.dubbing_id} expected_duration=${response.expected_duration_sec}s`);
-  return response.dubbing_id;
+  const data = await res.json();
+  if (!data.dubbing_id) throw new Error(`No dubbing_id returned for [${jobId}][${langCode}]`);
+  console.log(`Dub started [${jobId}][${langCode}]: dubbing_id=${data.dubbing_id} expected=${data.expected_duration_sec}s`);
+  return data.dubbing_id;
 }
 
-/**
- * Polls until dubbed, then downloads each langCode and uploads to S3.
- * Polls up to 90 × 5s = 7.5 minutes.
- * langCodes is an array of language code strings.
- * Returns a map of { [langCode]: s3Url }
- */
-async function pollAndDownloadDub(dubbingId, langCodes, jobId) {
-  const MAX_POLLS = 90;   // 7.5 minutes total
-  const POLL_INTERVAL = 5000;
+async function pollDub(dubbingId, langCode, jobId) {
+  // Poll up to 90 × 5s = 7.5 minutes
+  for (let i = 0; i < 90; i++) {
+    await new Promise(r => setTimeout(r, 5000));
 
-  for (let i = 0; i < MAX_POLLS; i++) {
-    await new Promise(r => setTimeout(r, POLL_INTERVAL));
+    const res = await fetch(`https://api.elevenlabs.io/v1/dubbing/${dubbingId}`, {
+      headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY }
+    });
 
-    const metadata = await elevenlabs.dubbing.getMetadata(dubbingId);
-    console.log(`Dub poll [${jobId}] attempt ${i + 1}/${MAX_POLLS}: status=${metadata.status}`);
-
-    if (metadata.status === "dubbed") {
-      // Download each language and upload to S3
-      const results = {};
-      await Promise.all(langCodes.map(async (langCode) => {
-        try {
-          const stream = await elevenlabs.dubbing.getAudio(dubbingId, langCode);
-          const chunks = [];
-          for await (const chunk of stream) chunks.push(chunk);
-          const buffer = Buffer.concat(chunks);
-          const s3Key = `dubbed/${dubbingId}_${langCode}_${Date.now()}.mp4`;
-          results[langCode] = await uploadToS3(buffer, s3Key, "video/mp4");
-          console.log(`Dub audio downloaded [${jobId}][${langCode}]: ${results[langCode]}`);
-        } catch (err) {
-          console.error(`Failed to download dubbed audio [${jobId}][${langCode}]:`, err?.message);
-          results[langCode] = null;
-        }
-      }));
-      return results;
+    if (!res.ok) {
+      console.warn(`Dub status check failed [${jobId}][${langCode}] HTTP ${res.status}, retrying...`);
+      continue;
     }
 
-    if (metadata.status === "failed") {
-      throw new Error(`ElevenLabs dubbing failed [${jobId}]: ${metadata.error_message || "unknown error"}`);
+    const data = await res.json();
+    console.log(`Dub poll [${jobId}][${langCode}] attempt ${i + 1}/90: status=${data.status}`);
+
+    if (data.status === "dubbed") {
+      // Download dubbed audio from ElevenLabs
+      const audioRes = await fetch(`https://api.elevenlabs.io/v1/dubbing/${dubbingId}/audio/${langCode}`, {
+        headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY }
+      });
+      if (!audioRes.ok) {
+        throw new Error(`Failed to download dubbed audio [${jobId}][${langCode}] HTTP ${audioRes.status}`);
+      }
+      const buffer = Buffer.from(await audioRes.arrayBuffer());
+      const s3Url = await uploadToS3(buffer, `dubbed/${dubbingId}_${langCode}_${Date.now()}.mp4`, "video/mp4");
+      console.log(`Dub complete [${jobId}][${langCode}]: ${s3Url}`);
+      return s3Url;
     }
 
+    if (data.status === "failed") {
+      throw new Error(`ElevenLabs dubbing failed [${jobId}][${langCode}]: ${data.error_message || "unknown"}`);
+    }
     // status === "dubbing" — keep polling
   }
 
-  throw new Error(`Dubbing timed out after ${(MAX_POLLS * POLL_INTERVAL) / 60000} minutes [${jobId}]`);
+  throw new Error(`Dubbing timed out after 7.5 minutes [${jobId}][${langCode}]`);
 }
 
 /* -------------------------
@@ -561,16 +548,9 @@ async function runDubbing(job) {
 
   try {
     videoUrl = await normalizeVideoInput(videoUrl);
-    console.log(`runDubbing [${jobId}]: normalized URL ready, starting dub to [${langCode}]`);
-
-    const dubbingId = await startElevenLabsDub(videoUrl, langCode);
-    console.log(`runDubbing [${jobId}]: dubbing_id=${dubbingId}`);
-
-    const dlResults = await pollAndDownloadDub(dubbingId, [langCode], jobId);
-    const dubbedFileUrl = dlResults[langCode] || "";
-    if (!dubbedFileUrl) throw new Error("Dubbed file download returned empty URL");
+    const dubbingId = await startDub(videoUrl, langCode, jobId);
+    const dubbedFileUrl = await pollDub(dubbingId, langCode, jobId);
     return { type: "object", value: { jobId, status: "completed", dubbedFileUrl } };
-
   } catch (err) {
     console.error("Dubbing error:", err?.message || err);
     return { type: "object", value: { jobId, status: "failed", reason: err.message || "Unexpected dubbing error", dubbedFileUrl: "" } };
@@ -588,13 +568,12 @@ async function runMultiDubbing(job) {
   }
 
   try {
-    // Normalize once — all languages reuse the same S3 source URL
+    // Normalize once — all language jobs reuse the same S3 source URL
     videoUrl = await normalizeVideoInput(videoUrl);
     console.log(`runMultiDubbing [${jobId}]: normalized URL ready, starting ${targetLanguages.length} dubs`);
 
     const results = {};
 
-    // One dubbing job per language — ElevenLabs only accepts single target_lang
     await Promise.all(targetLanguages.map(async (lang) => {
       const langCode = getLanguageCode(lang);
       if (!langCode) {
@@ -602,11 +581,9 @@ async function runMultiDubbing(job) {
         return;
       }
       try {
-        const dubbingId = await startElevenLabsDub(videoUrl, langCode);
-        console.log(`runMultiDubbing [${jobId}][${langCode}]: dubbing_id=${dubbingId}`);
-        const dlResults = await pollAndDownloadDub(dubbingId, [langCode], jobId);
-        const audio = dlResults[langCode] || "";
-        results[langCode] = audio ? { audio, subtitles: "" } : { error: "Download failed" };
+        const dubbingId = await startDub(videoUrl, langCode, jobId);
+        const audio = await pollDub(dubbingId, langCode, jobId);
+        results[langCode] = { audio, subtitles: "" };
       } catch (err) {
         console.error(`runMultiDubbing [${jobId}][${langCode}] failed:`, err?.message || err);
         results[langCode] = { error: err.message || "Dubbing failed" };
@@ -617,7 +594,6 @@ async function runMultiDubbing(job) {
     if (successes.length === 0) {
       return { type: "object", value: { jobId, status: "failed", reason: "All dubbing attempts failed", dubbedFiles: results } };
     }
-
     return { type: "object", value: { jobId, status: "completed", dubbedFiles: results } };
 
   } catch (err) {
@@ -711,7 +687,6 @@ async function runVoiceRecast(job) {
       return { type: "object", value: { jobId, status: "failed", reason: "Audio file too large (max 25MB)", audio: "" } };
     }
 
-    // ElevenLabs STS cap is 300s — estimate from file size at 128kbps
     const estimatedDurationSeconds = (audioBuffer.length / 128000) * 8;
     if (estimatedDurationSeconds > 295) {
       return { type: "object", value: { jobId, status: "failed", reason: "Audio too long for voice recast (max ~5 minutes)", audio: "" } };
@@ -826,10 +801,6 @@ async function main() {
       const phase = Number(memoToSign.nextPhase);
       const jobId = job.id.toString();
 
-      /* -------------------------------------------------------
-         PHASE 1 — ACCEPT / REJECT
-      ------------------------------------------------------- */
-
       if (phase === 1) {
         if (processedPhase1.has(jobId)) {
           console.log("Phase 1 already handled:", jobId);
@@ -870,11 +841,6 @@ async function main() {
         }
         return;
       }
-
-      /* -------------------------------------------------------
-         PHASE 3 — DELIVER
-         Waits up to 7.5 minutes to cover full dubbing poll window.
-      ------------------------------------------------------- */
 
       if (phase === 3) {
         if (processedPhase3.has(jobId)) {
@@ -917,10 +883,6 @@ async function main() {
         return;
       }
 
-      /* -------------------------------------------------------
-         PHASE 4 — EVALUATE
-      ------------------------------------------------------- */
-
       if (phase === 4) {
         try {
           const success = job.result?.status === "completed";
@@ -942,7 +904,6 @@ async function main() {
     process.exit(1);
   }
 
-  // Heartbeat
   setInterval(() => {
     console.log("Heartbeat", new Date().toISOString());
     for (const type of Object.keys(queues)) {
