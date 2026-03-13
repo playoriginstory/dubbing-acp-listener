@@ -479,14 +479,13 @@ function validateRequirement(jobName, req) {
 
 /**
  * Starts a dubbing job via the ElevenLabs SDK (v2.30+).
- * client.dubbing.create() accepts source_url and target_lang as array or string.
+ * client.dubbing.create() with a single target_lang string.
  * Returns the dubbing_id string.
  */
-async function startElevenLabsDub(videoUrl, langCodes) {
-  // langCodes can be a single string or array of strings
+async function startElevenLabsDub(videoUrl, langCode) {
   const response = await elevenlabs.dubbing.create({
     source_url: videoUrl,       // public S3 URL produced by normalizeVideoInput
-    target_lang: langCodes,     // string or string[] both accepted
+    target_lang: langCode,      // single language code string e.g. "zh", "es"
     source_lang: "auto",
     mode: "automatic",
     num_speakers: 0,            // 0 = auto-detect
@@ -595,15 +594,24 @@ async function runMultiDubbing(job) {
 
     const results = {};
 
-    // Single dubbing job for all languages — ElevenLabs SDK supports array target_lang
-    const langCodes = targetLanguages.map(getLanguageCode).filter(Boolean);
-    console.log(`runMultiDubbing [${jobId}]: submitting single job for langs: ${langCodes.join(", ")}`);
-    const dubbingId = await startElevenLabsDub(videoUrl, langCodes);
-    console.log(`runMultiDubbing [${jobId}]: dubbing_id=${dubbingId}`);
-    const dlResults = await pollAndDownloadDub(dubbingId, langCodes, jobId);
-    for (const [langCode, s3Url] of Object.entries(dlResults)) {
-      results[langCode] = s3Url ? { audio: s3Url, subtitles: "" } : { error: "Download failed" };
-    }
+    // One dubbing job per language — ElevenLabs only accepts single target_lang
+    await Promise.all(targetLanguages.map(async (lang) => {
+      const langCode = getLanguageCode(lang);
+      if (!langCode) {
+        console.warn(`runMultiDubbing [${jobId}]: unsupported language "${lang}", skipping`);
+        return;
+      }
+      try {
+        const dubbingId = await startElevenLabsDub(videoUrl, langCode);
+        console.log(`runMultiDubbing [${jobId}][${langCode}]: dubbing_id=${dubbingId}`);
+        const dlResults = await pollAndDownloadDub(dubbingId, [langCode], jobId);
+        const audio = dlResults[langCode] || "";
+        results[langCode] = audio ? { audio, subtitles: "" } : { error: "Download failed" };
+      } catch (err) {
+        console.error(`runMultiDubbing [${jobId}][${langCode}] failed:`, err?.message || err);
+        results[langCode] = { error: err.message || "Dubbing failed" };
+      }
+    }));
 
     const successes = Object.values(results).filter(r => r.audio);
     if (successes.length === 0) {
