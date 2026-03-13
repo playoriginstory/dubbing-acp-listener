@@ -115,7 +115,7 @@ const PROCESSING_TIME = {
 const AUTO_DELIVER_DELAY = {
   voiceover:        5000,
   voicerecast:      9000,
-  dubbing:        470000,   // 7.5min poll + buffer
+  dubbing:        470000,
   multidubbing:   470000,
   musicproduction: 35000,
 };
@@ -148,6 +148,7 @@ const jobResultCache = new Map();
 
 const processedPhase1 = new Set();
 const processedPhase3 = new Set();
+const processedEvaluate = new Set();
 
 /* -------------------------
    PER-TYPE CONCURRENCY QUEUES
@@ -462,9 +463,7 @@ function validateRequirement(jobName, req) {
 }
 
 /* -------------------------
-   ELEVENLABS DUBBING — raw fetch, no SDK
-   Identical logic to the graduation-passing version,
-   just pointing at api.elevenlabs.io instead of the Vercel proxy.
+   ELEVENLABS DUBBING — direct REST, no proxy
 -------------------------- */
 
 async function startDub(videoUrl, langCode, jobId) {
@@ -511,7 +510,6 @@ async function pollDub(dubbingId, langCode, jobId) {
     console.log(`Dub poll [${jobId}][${langCode}] attempt ${i + 1}/90: status=${data.status}`);
 
     if (data.status === "dubbed") {
-      // Download dubbed audio from ElevenLabs
       const audioRes = await fetch(`https://api.elevenlabs.io/v1/dubbing/${dubbingId}/audio/${langCode}`, {
         headers: { "xi-api-key": process.env.ELEVENLABS_API_KEY }
       });
@@ -527,7 +525,6 @@ async function pollDub(dubbingId, langCode, jobId) {
     if (data.status === "failed") {
       throw new Error(`ElevenLabs dubbing failed [${jobId}][${langCode}]: ${data.error_message || "unknown"}`);
     }
-    // status === "dubbing" — keep polling
   }
 
   throw new Error(`Dubbing timed out after 7.5 minutes [${jobId}][${langCode}]`);
@@ -568,7 +565,6 @@ async function runMultiDubbing(job) {
   }
 
   try {
-    // Normalize once — all language jobs reuse the same S3 source URL
     videoUrl = await normalizeVideoInput(videoUrl);
     console.log(`runMultiDubbing [${jobId}]: normalized URL ready, starting ${targetLanguages.length} dubs`);
 
@@ -785,6 +781,9 @@ async function main() {
   const acpClient = new AcpClient({
     acpContractClient,
 
+    /* -------------------------------------------------------
+       onNewTask — handles Phase 1 (accept) and Phase 3 (deliver)
+    ------------------------------------------------------- */
     onNewTask: async (job, memoToSign) => {
       console.log("Incoming job:", {
         id: job?.id,
@@ -801,6 +800,9 @@ async function main() {
       const phase = Number(memoToSign.nextPhase);
       const jobId = job.id.toString();
 
+      /* -------------------------------------------------------
+         PHASE 1 — ACCEPT / REJECT
+      ------------------------------------------------------- */
       if (phase === 1) {
         if (processedPhase1.has(jobId)) {
           console.log("Phase 1 already handled:", jobId);
@@ -842,6 +844,9 @@ async function main() {
         return;
       }
 
+      /* -------------------------------------------------------
+         PHASE 3 — DELIVER
+      ------------------------------------------------------- */
       if (phase === 3) {
         if (processedPhase3.has(jobId)) {
           console.log("Phase 3 already handled:", jobId);
@@ -882,16 +887,30 @@ async function main() {
         }
         return;
       }
+    },
 
-      if (phase === 4) {
-        try {
-          const success = job.result?.status === "completed";
-          await safeEvaluate(job, success, success ? "Service completed successfully" : "Service failed");
-          console.log(success ? "Escrow released:" : "Escrow refunded:", jobId);
-        } catch (err) {
-          console.error("Phase 4 error:", err);
-        }
+    /* -------------------------------------------------------
+       onEvaluate — handles Phase 4 (escrow release/refund)
+       This is the correct SDK callback for evaluation in ACP v2.
+       The buyer/evaluator triggers this after delivery.
+    ------------------------------------------------------- */
+    onEvaluate: async (job) => {
+      const jobId = job.id.toString();
+
+      if (processedEvaluate.has(jobId)) {
+        console.log("Evaluate already handled:", jobId);
         return;
+      }
+      processedEvaluate.add(jobId);
+
+      console.log("onEvaluate fired:", jobId, "result:", JSON.stringify(job.result));
+
+      try {
+        const success = job.result?.status === "completed";
+        await safeEvaluate(job, success, success ? "Service completed successfully" : "Service failed");
+        console.log(success ? "Escrow released:" : "Escrow refunded:", jobId);
+      } catch (err) {
+        console.error("Evaluate error:", jobId, err?.message || err);
       }
     }
   });
