@@ -789,7 +789,10 @@ async function main() {
         id: job?.id,
         name: job?.name,
         phase: memoToSign?.nextPhase,
-        memoCount: job?.memos?.length
+        memoCount: job?.memos?.length,
+        provider: job?.providerAddress,
+        client: job?.clientAddress,
+        evaluator: job?.evaluatorAddress
       });
 
       if (!memoToSign) {
