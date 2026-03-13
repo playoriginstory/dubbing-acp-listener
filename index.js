@@ -758,6 +758,10 @@ async function dispatchJob(job) {
    ACP MAIN
 -------------------------- */
 
+/* -------------------------
+   ACP MAIN
+-------------------------- */
+
 async function main() {
   console.log("Starting DUELS PRODUCTION agent...");
   console.log("ENV check:", {
@@ -769,22 +773,64 @@ async function main() {
     hasAwsBucket:  !!process.env.AWS_S3_BUCKET,
   });
 
+  /* -------------------------
+     BUILD CLIENT WITH RETRY
+  -------------------------- */
+
+  async function buildClientWithRetry() {
+    let attempts = 0;
+
+    while (attempts < 5) {
+      try {
+        console.log(`Building ACP client attempt ${attempts + 1}`);
+
+        const client = await AcpContractClientV2.build(
+          process.env.WHITELISTED_WALLET_PRIVATE_KEY,
+          parseInt(process.env.SELLER_ENTITY_ID),
+          process.env.SELLER_AGENT_WALLET_ADDRESS
+        );
+
+        console.log("AcpContractClient built successfully");
+        return client;
+
+      } catch (err) {
+        attempts++;
+
+        console.log(
+          "ACP build retry:",
+          err?.shortMessage || err?.message
+        );
+
+        if (attempts >= 5) throw err;
+
+        await new Promise(r => setTimeout(r, 5000));
+      }
+    }
+  }
+
+  /* -------------------------
+     INITIALIZE ACP CLIENT
+  -------------------------- */
+
   let acpContractClient;
+
   try {
-    acpContractClient = await AcpContractClientV2.build(
-      process.env.WHITELISTED_WALLET_PRIVATE_KEY,
-      parseInt(process.env.SELLER_ENTITY_ID),
-      process.env.SELLER_AGENT_WALLET_ADDRESS
-    );
-    console.log("AcpContractClient built successfully");
+    console.log("Waiting for RPC warmup...");
+    await new Promise(r => setTimeout(r, 3000));
+
+    acpContractClient = await buildClientWithRetry();
+
   } catch (err) {
-    console.error("FATAL: AcpContractClientV2.build() failed:", err);
+    console.error("FATAL: ACP client failed to build:", err);
     process.exit(1);
   }
 
+  /* -------------------------
+     CREATE ACP CLIENT
+  -------------------------- */
+
   const acpClient = new AcpClient({
     acpContractClient,
-
     /* -------------------------------------------------------
        onNewTask — handles Phase 1 (accept) and Phase 3 (deliver)
     ------------------------------------------------------- */
