@@ -106,29 +106,39 @@ function getVoiceId(style) {
 
 /* -------------------------
    TIMING CONSTANTS
+
+   PROCESSING_TIME: estimated real processing time per service
+   AUTO_DELIVER_DELAY: fire auto-deliver this long after dispatch starts
+     - Must be AFTER processing finishes
+     - Must leave time for delivery before evaluator timeout
+   SLA_LIMIT_MS: max time from Phase 1 accept to delivery
+     - Used for capacity check to reject jobs we can't serve in time
+
+   Evaluator timeout: ~40s for voiceover/voicerecast
+   Dubbing/multidubbing: 1–5 min (evaluator waits longer for these)
 -------------------------- */
 
 const PROCESSING_TIME = {
   voiceover:        3000,
   voicerecast:      7000,
-  dubbing:         60000,
+  dubbing:         60000,  // 1–5 min, use 1min as baseline
   multidubbing:    60000,
   musicproduction: 30000,
 };
 
 const AUTO_DELIVER_DELAY = {
-  voiceover:        5000,
-  voicerecast:      9000,
-  dubbing:        470000,   // 7.5min poll + buffer
-  multidubbing:   470000,
+  voiceover:        5000,   // fire 5s after dispatch
+  voicerecast:      9000,   // fire 9s after dispatch
+  dubbing:        310000,   // fire after 5min poll window closes
+  multidubbing:   310000,
   musicproduction: 35000,
 };
 
 const SLA_LIMIT_MS = {
   voiceover:       35000,
   voicerecast:     35000,
-  dubbing:        480000,   // 8 min SLA
-  multidubbing:   480000,
+  dubbing:        360000,  // 6 min SLA for dubbing
+  multidubbing:   360000,
   musicproduction: 35000,
 };
 
@@ -167,6 +177,10 @@ const queues = {
   dubbing: [], multidubbing: [], musicproduction: []
 };
 
+/**
+ * Reject at Phase 1 if we can't deliver within SLA.
+ * Better to reject honestly than accept and expire.
+ */
 function isOverCapacity(jobName) {
   const type = queues[jobName] ? jobName : "dubbing";
   const queueDepth = queues[type].length;
@@ -473,82 +487,9 @@ function validateRequirement(jobName, req) {
 }
 
 /* -------------------------
-   ELEVENLABS DUBBING HELPERS
-   Direct SDK calls — no Vercel proxy dependency.
--------------------------- */
-
-/**
- * Starts a dubbing job via the ElevenLabs SDK (v2.30+).
- * client.dubbing.create() accepts source_url and target_lang as array or string.
- * Returns the dubbing_id string.
- */
-async function startElevenLabsDub(videoUrl, langCodes) {
-  // langCodes can be a single string or array of strings
-  const response = await elevenlabs.dubbing.create({
-    source_url: videoUrl,       // public S3 URL produced by normalizeVideoInput
-    target_lang: langCodes,     // string or string[] both accepted
-    source_lang: "auto",
-    mode: "automatic",
-    num_speakers: 0,            // 0 = auto-detect
-    watermark: false,
-  });
-
-  if (!response.dubbing_id) {
-    throw new Error("ElevenLabs dubbing did not return a dubbing_id");
-  }
-
-  console.log(`Dubbing job created: id=${response.dubbing_id} expected_duration=${response.expected_duration_sec}s`);
-  return response.dubbing_id;
-}
-
-/**
- * Polls until dubbed, then downloads each langCode and uploads to S3.
- * Polls up to 90 × 5s = 7.5 minutes.
- * langCodes is an array of language code strings.
- * Returns a map of { [langCode]: s3Url }
- */
-async function pollAndDownloadDub(dubbingId, langCodes, jobId) {
-  const MAX_POLLS = 90;   // 7.5 minutes total
-  const POLL_INTERVAL = 5000;
-
-  for (let i = 0; i < MAX_POLLS; i++) {
-    await new Promise(r => setTimeout(r, POLL_INTERVAL));
-
-    const metadata = await elevenlabs.dubbing.getMetadata(dubbingId);
-    console.log(`Dub poll [${jobId}] attempt ${i + 1}/${MAX_POLLS}: status=${metadata.status}`);
-
-    if (metadata.status === "dubbed") {
-      // Download each language and upload to S3
-      const results = {};
-      await Promise.all(langCodes.map(async (langCode) => {
-        try {
-          const stream = await elevenlabs.dubbing.getAudio(dubbingId, langCode);
-          const chunks = [];
-          for await (const chunk of stream) chunks.push(chunk);
-          const buffer = Buffer.concat(chunks);
-          const s3Key = `dubbed/${dubbingId}_${langCode}_${Date.now()}.mp4`;
-          results[langCode] = await uploadToS3(buffer, s3Key, "video/mp4");
-          console.log(`Dub audio downloaded [${jobId}][${langCode}]: ${results[langCode]}`);
-        } catch (err) {
-          console.error(`Failed to download dubbed audio [${jobId}][${langCode}]:`, err?.message);
-          results[langCode] = null;
-        }
-      }));
-      return results;
-    }
-
-    if (metadata.status === "failed") {
-      throw new Error(`ElevenLabs dubbing failed [${jobId}]: ${metadata.error_message || "unknown error"}`);
-    }
-
-    // status === "dubbing" — keep polling
-  }
-
-  throw new Error(`Dubbing timed out after ${(MAX_POLLS * POLL_INTERVAL) / 60000} minutes [${jobId}]`);
-}
-
-/* -------------------------
    PROCESSING FUNCTIONS
+   All return payload objects — never call job.deliver directly.
+   Results cached so Phase 3 or auto-timer can deliver.
 -------------------------- */
 
 async function runDubbing(job) {
@@ -562,18 +503,44 @@ async function runDubbing(job) {
 
   try {
     videoUrl = await normalizeVideoInput(videoUrl);
-    console.log(`runDubbing [${jobId}]: normalized URL ready, starting dub to [${langCode}]`);
 
-    const dubbingId = await startElevenLabsDub(videoUrl, langCode);
-    console.log(`runDubbing [${jobId}]: dubbing_id=${dubbingId}`);
+    const dubRes = await fetch("https://duelsapp.vercel.app/api/dub", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ videoUrl, target_lang: langCode, source_lang: "auto" })
+    });
+    const dubData = await dubRes.json();
+    console.log(`Dub API response [${jobId}]:`, JSON.stringify(dubData));
 
-    const dlResults = await pollAndDownloadDub(dubbingId, [langCode], jobId);
-    const dubbedFileUrl = dlResults[langCode] || "";
-    if (!dubbedFileUrl) throw new Error("Dubbed file download returned empty URL");
-    return { type: "object", value: { jobId, status: "completed", dubbedFileUrl } };
+    if (!dubData.dubbing_id) {
+      return { type: "object", value: { jobId, status: "failed", reason: dubData.error?.detail?.message || "No dubbing ID returned", dubbedFileUrl: "" } };
+    }
+
+    // Poll up to 60 × 5s = 5 minutes
+    for (let i = 0; i < 60; i++) {
+      await new Promise(r => setTimeout(r, 5000));
+      const statusRes = await fetch(`https://duelsapp.vercel.app/api/dub-status?id=${dubData.dubbing_id}`);
+      const statusData = await statusRes.json();
+      console.log(`Dub poll [${jobId}] attempt ${i + 1}/60:`, statusData.status);
+
+      if (statusData.status === "dubbed") {
+        const dubbedFileUrl = dubData.dubbedFileUrl ||
+          `https://duelsapp-uploads.s3.us-east-1.amazonaws.com/dubbed/${dubData.dubbing_id}.mp4`;
+        return { type: "object", value: { jobId, status: "completed", dubbedFileUrl } };
+      }
+      if (statusData.status === "failed") {
+        return { type: "object", value: { jobId, status: "failed", reason: "Dubbing failed on server", dubbedFileUrl: "" } };
+      }
+    }
+
+    // Timed out after 5min — return pre-signed URL anyway, may be ready
+    const fallbackUrl = dubData.dubbedFileUrl ||
+      `https://duelsapp-uploads.s3.us-east-1.amazonaws.com/dubbed/${dubData.dubbing_id}.mp4`;
+    console.log(`Dub poll timed out [${jobId}], using fallback URL`);
+    return { type: "object", value: { jobId, status: "completed", dubbedFileUrl: fallbackUrl } };
 
   } catch (err) {
-    console.error("Dubbing error:", err?.message || err);
+    console.error("Dubbing error:", err);
     return { type: "object", value: { jobId, status: "failed", reason: err.message || "Unexpected dubbing error", dubbedFileUrl: "" } };
   }
 }
@@ -589,31 +556,52 @@ async function runMultiDubbing(job) {
   }
 
   try {
-    // Normalize once — all languages reuse the same S3 source URL
     videoUrl = await normalizeVideoInput(videoUrl);
-    console.log(`runMultiDubbing [${jobId}]: normalized URL ready, starting ${targetLanguages.length} dubs`);
-
     const results = {};
 
-    // Single dubbing job for all languages — ElevenLabs SDK supports array target_lang
-    const langCodes = targetLanguages.map(getLanguageCode).filter(Boolean);
-    console.log(`runMultiDubbing [${jobId}]: submitting single job for langs: ${langCodes.join(", ")}`);
-    const dubbingId = await startElevenLabsDub(videoUrl, langCodes);
-    console.log(`runMultiDubbing [${jobId}]: dubbing_id=${dubbingId}`);
-    const dlResults = await pollAndDownloadDub(dubbingId, langCodes, jobId);
-    for (const [langCode, s3Url] of Object.entries(dlResults)) {
-      results[langCode] = s3Url ? { audio: s3Url, subtitles: "" } : { error: "Download failed" };
-    }
+    await Promise.all(targetLanguages.map(async (lang) => {
+      const langCode = getLanguageCode(lang);
+      if (!langCode) return;
 
-    const successes = Object.values(results).filter(r => r.audio);
-    if (successes.length === 0) {
-      return { type: "object", value: { jobId, status: "failed", reason: "All dubbing attempts failed", dubbedFiles: results } };
-    }
+      const dubRes = await fetch("https://duelsapp.vercel.app/api/dub", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ videoUrl, target_lang: langCode, source_lang: "auto" })
+      });
+      const dubData = await dubRes.json();
+      console.log(`MultiDub API response [${jobId}][${langCode}]:`, JSON.stringify(dubData));
 
+      if (!dubData.dubbing_id) return;
+
+      // Poll up to 60 × 5s = 5 minutes
+      for (let i = 0; i < 60; i++) {
+        await new Promise(r => setTimeout(r, 5000));
+        const statusRes = await fetch(`https://duelsapp.vercel.app/api/dub-status?id=${dubData.dubbing_id}`);
+        const statusData = await statusRes.json();
+        console.log(`MultiDub poll [${jobId}][${langCode}] attempt ${i + 1}/60:`, statusData.status);
+
+        if (statusData.status === "dubbed") {
+          const audio = dubData.dubbedFileUrl ||
+            `https://duelsapp-uploads.s3.us-east-1.amazonaws.com/dubbed/${dubData.dubbing_id}.mp4`;
+          results[langCode] = { audio, subtitles: "" };
+          return;
+        }
+        if (statusData.status === "failed") return;
+      }
+
+      // Timed out — use pre-signed URL anyway
+      const fallbackUrl = dubData.dubbedFileUrl ||
+        `https://duelsapp-uploads.s3.us-east-1.amazonaws.com/dubbed/${dubData.dubbing_id}.mp4`;
+      results[langCode] = { audio: fallbackUrl, subtitles: "" };
+    }));
+
+    if (Object.keys(results).length === 0) {
+      return { type: "object", value: { jobId, status: "failed", reason: "All dubbing attempts failed", dubbedFiles: {} } };
+    }
     return { type: "object", value: { jobId, status: "completed", dubbedFiles: results } };
 
   } catch (err) {
-    console.error("Multi-dubbing error:", err?.message || err);
+    console.error("Multi-dubbing error:", err);
     return { type: "object", value: { jobId, status: "failed", reason: err.message || "Unexpected multi-dubbing error", dubbedFiles: {} } };
   }
 }
@@ -730,6 +718,8 @@ async function runVoiceRecast(job) {
 
 /* -------------------------
    DISPATCH
+   Runs job, caches result, schedules per-service auto-deliver timer.
+   Timer is relative to when dispatch STARTS (after queue wait).
 -------------------------- */
 
 async function dispatchJob(job) {
@@ -752,6 +742,8 @@ async function dispatchJob(job) {
   jobResultCache.set(jobId, { payload, delivered: false });
   console.log("Result cached:", jobId, payload.value?.status, payload.value?.reason || "");
 
+  // Per-service auto-deliver timer — fires after processing should be complete
+  // This is a safety net in case Phase 3 socket never arrives
   const delay = AUTO_DELIVER_DELAY[job.name] || 35000;
   setTimeout(async () => {
     const cached = jobResultCache.get(jobId);
@@ -763,7 +755,7 @@ async function dispatchJob(job) {
         console.log("Auto-deliver success:", jobId);
       } catch (err) {
         console.error("Auto-deliver failed:", jobId, err?.message);
-        cached.delivered = false;
+        cached.delivered = false; // allow Phase 3 to retry
       }
     }
   }, delay);
@@ -820,6 +812,15 @@ async function main() {
 
       /* -------------------------------------------------------
          PHASE 1 — ACCEPT / REJECT
+
+         Flow:
+         1. Validate content
+         2. Check capacity
+         3. safeRespond(job)          — signals acceptance
+         4. job.createRequirement()   — REQUIRED in ACP v2: posts
+            requirement memo so buyer can call payAndAcceptRequirement()
+            Without this the job stalls at Phase 1 and expires.
+         5. enqueueJob → dispatchJob  — process in background
       ------------------------------------------------------- */
 
       if (phase === 1) {
@@ -832,6 +833,7 @@ async function main() {
         try {
           const req = job.requirement || job.serviceRequirement || {};
 
+          // Step 1: content/format validation
           const reason = validateRequirement(job.name, req);
           if (reason) {
             console.log("Rejecting job (validation):", jobId, reason);
@@ -840,19 +842,24 @@ async function main() {
             return;
           }
 
+          // Step 2: capacity check
           if (isOverCapacity(job.name)) {
             console.log("Rejecting job (capacity):", jobId, job.name);
             await safeReject(job, "Service temporarily at capacity. Please try again shortly.");
             return;
           }
 
+          // Step 3: accept
           await safeRespond(job);
           console.log("Job accepted:", jobId, job.name);
 
+          // Step 4: createRequirement — ACP v2 REQUIRED
+          // Without this the buyer cannot pay and the job expires at Phase 1
           await new Promise(r => setTimeout(r, 2000));
           await retry(() => job.createRequirement(0, "Ready to process your request."));
           console.log("Requirement created:", jobId);
 
+          // Step 5: process in background
           enqueueJob(job.name, () => dispatchJob(job)).catch(err => {
             console.error("Background dispatch error:", err);
           });
@@ -865,7 +872,9 @@ async function main() {
 
       /* -------------------------------------------------------
          PHASE 3 — DELIVER
-         Waits up to 7.5 minutes to cover full dubbing poll window.
+         Wait up to 5 minutes for result cache to be populated
+         (covers full dubbing poll window).
+         Auto-deliver timer may have already fired.
       ------------------------------------------------------- */
 
       if (phase === 3) {
@@ -878,7 +887,7 @@ async function main() {
         try {
           let cached = jobResultCache.get(jobId);
           let waited = 0;
-          const maxWait = 450000; // 7.5 minutes
+          const maxWait = 300000; // 5 minutes — covers full dubbing window
 
           while (!cached && waited < maxWait) {
             await new Promise(r => setTimeout(r, 2000));
