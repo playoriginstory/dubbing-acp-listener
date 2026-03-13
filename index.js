@@ -857,38 +857,81 @@ async function main() {
           return;
         }
         processedPhase3.add(jobId);
-
+      
         try {
           let cached = jobResultCache.get(jobId);
           let waited = 0;
           const maxWait = 450000; // 7.5 minutes
-
+      
           while (!cached && waited < maxWait) {
             await new Promise(r => setTimeout(r, 2000));
             waited += 2000;
             cached = jobResultCache.get(jobId);
+      
             if (waited % 30000 === 0) {
               console.log(`Phase 3 still waiting for cache [${jobId}]: ${waited / 1000}s elapsed`);
             }
           }
-
+      
           if (cached && !cached.delivered) {
             cached.delivered = true;
+      
             console.log("Delivering from Phase 3:", jobId, cached.payload.value);
+      
             await safeDeliver(job, cached.payload);
+      
             console.log("Phase 3 delivery success:", jobId);
-          } else if (cached && cached.delivered) {
+      
+            /* -------------------------
+               FALLBACK AUTO-EVALUATION
+               prevents jobs stuck at phase 3
+            -------------------------- */
+      
+            setTimeout(async () => {
+              try {
+                if (processedEvaluate.has(jobId)) {
+                  console.log("Evaluation already handled:", jobId);
+                  return;
+                }
+      
+                const success = cached.payload?.value?.status === "completed";
+      
+                console.log("Attempting fallback evaluation:", jobId);
+      
+                await safeEvaluate(
+                  job,
+                  success,
+                  success
+                    ? "Auto-evaluated: service completed"
+                    : "Auto-evaluated: service failed"
+                );
+      
+                processedEvaluate.add(jobId);
+      
+                console.log("Fallback evaluation complete:", jobId);
+              } catch (err) {
+                console.log("Fallback evaluation skipped (not evaluator wallet):", jobId);
+              }
+            }, 120000); // wait 2 minutes
+          }
+      
+          else if (cached && cached.delivered) {
             console.log("Already delivered by auto-timer:", jobId);
-          } else {
+          }
+      
+          else {
             console.log("No cached result after wait, delivering fallback:", jobId);
+      
             await safeDeliver(job, {
               type: "url",
               value: "error: Processing did not complete in time"
             });
           }
+      
         } catch (err) {
           console.error("Phase 3 error:", err);
         }
+      
         return;
       }
     },
