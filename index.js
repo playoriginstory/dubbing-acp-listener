@@ -540,17 +540,17 @@ async function runDubbing(job) {
   const jobId = job.id.toString();
 
   if (!videoUrl || !langCode) {
-    return { type: "object", value: { jobId, status: "failed", reason: "Missing videoUrl or invalid targetLanguage", dubbedFileUrl: "" } };
+    return { type: "url", value: `error: Missing videoUrl or invalid targetLanguage` };
   }
 
   try {
     videoUrl = await normalizeVideoInput(videoUrl);
     const dubbingId = await startDub(videoUrl, langCode, jobId);
     const dubbedFileUrl = await pollDub(dubbingId, langCode, jobId);
-    return { type: "object", value: { jobId, status: "completed", dubbedFileUrl } };
+    return { type: "url", value: dubbedFileUrl };
   } catch (err) {
     console.error("Dubbing error:", err?.message || err);
-    return { type: "object", value: { jobId, status: "failed", reason: err.message || "Unexpected dubbing error", dubbedFileUrl: "" } };
+    return { type: "url", value: `error: ${err.message || "Unexpected dubbing error"}` };
   }
 }
 
@@ -561,7 +561,7 @@ async function runMultiDubbing(job) {
   console.log(`runMultiDubbing [${jobId}]:`, { videoUrl, targetLanguages });
 
   if (!videoUrl || !Array.isArray(targetLanguages) || targetLanguages.length === 0) {
-    return { type: "object", value: { jobId, status: "failed", reason: "Missing videoUrl or targetLanguages", dubbedFiles: {} } };
+    return { type: "url", value: "error: Missing videoUrl or targetLanguages" };
   }
 
   try {
@@ -570,7 +570,8 @@ async function runMultiDubbing(job) {
 
     const results = {};
 
-    await Promise.all(targetLanguages.map(async (lang) => {
+    await Promise.all(targetLanguages.map(async (lang, i) => {
+      await new Promise(r => setTimeout(r, i * 3000)); // stagger 3s apart to avoid 429
       const langCode = getLanguageCode(lang);
       if (!langCode) {
         console.warn(`runMultiDubbing [${jobId}]: unsupported language "${lang}", skipping`);
@@ -579,22 +580,25 @@ async function runMultiDubbing(job) {
       try {
         const dubbingId = await startDub(videoUrl, langCode, jobId);
         const audio = await pollDub(dubbingId, langCode, jobId);
-        results[langCode] = { audio, subtitles: "" };
+        results[langCode] = audio;
       } catch (err) {
         console.error(`runMultiDubbing [${jobId}][${langCode}] failed:`, err?.message || err);
-        results[langCode] = { error: err.message || "Dubbing failed" };
       }
     }));
 
-    const successes = Object.values(results).filter(r => r.audio);
+    const successes = Object.entries(results);
     if (successes.length === 0) {
-      return { type: "object", value: { jobId, status: "failed", reason: "All dubbing attempts failed", dubbedFiles: results } };
+      return { type: "url", value: "error: All dubbing attempts failed" };
     }
-    return { type: "object", value: { jobId, status: "completed", dubbedFiles: results } };
+
+    // Flat deliverable: "es: https://... | fr: https://... | de: https://..."
+    const urlList = successes.map(([lang, url]) => `${lang}: ${url}`).join(" | ");
+    console.log(`runMultiDubbing [${jobId}] deliverable:`, urlList);
+    return { type: "url", value: urlList };
 
   } catch (err) {
     console.error("Multi-dubbing error:", err?.message || err);
-    return { type: "object", value: { jobId, status: "failed", reason: err.message || "Unexpected multi-dubbing error", dubbedFiles: {} } };
+    return { type: "url", value: `error: ${err.message || "Unexpected multi-dubbing error"}` };
   }
 }
 
@@ -604,7 +608,7 @@ async function runVoiceover(job) {
   const voiceId = getVoiceId(voiceStyle);
 
   if (!text) {
-    return { type: "object", value: { jobId, status: "failed", audio: "" } };
+    return { type: "url", value: "error: Missing text" };
   }
 
   try {
@@ -615,16 +619,16 @@ async function runVoiceover(job) {
     });
 
     if (!response.ok) {
-      return { type: "object", value: { jobId, status: "failed", reason: `ElevenLabs TTS returned ${response.status}`, audio: "" } };
+      return { type: "url", value: `error: ElevenLabs TTS returned ${response.status}` };
     }
 
     const buffer = Buffer.from(await response.arrayBuffer());
     const url = await uploadToS3(buffer, `voiceover/${job.id}.mp3`, "audio/mpeg");
-    return { type: "object", value: { jobId, status: "completed", audio: url } };
+    return { type: "url", value: url };
 
   } catch (err) {
     console.error("Voiceover error:", err);
-    return { type: "object", value: { jobId, status: "failed", reason: err.message || "Unexpected voiceover error", audio: "" } };
+    return { type: "url", value: `error: ${err.message || "Unexpected voiceover error"}` };
   }
 }
 
@@ -633,7 +637,7 @@ async function runPremiumMusic(job) {
   const jobId = job.id.toString();
 
   if (!concept || !genre || !mood || !vocalStyle || !duration) {
-    return { type: "object", value: { jobId, status: "failed", audio: "" } };
+    return { type: "url", value: "error: Missing required music fields" };
   }
 
   try {
@@ -647,16 +651,16 @@ async function runPremiumMusic(job) {
     });
 
     if (!response.ok) {
-      return { type: "object", value: { jobId, status: "failed", reason: `ElevenLabs music API returned ${response.status}`, audio: "" } };
+      return { type: "url", value: `error: ElevenLabs music API returned ${response.status}` };
     }
 
     const buffer = Buffer.from(await response.arrayBuffer());
     const url = await uploadToS3(buffer, `music/${job.id}.mp3`, "audio/mpeg");
-    return { type: "object", value: { jobId, status: "completed", audio: url } };
+    return { type: "url", value: url };
 
   } catch (err) {
     console.error("Music error:", err);
-    return { type: "object", value: { jobId, status: "failed", reason: err.message || "Unexpected music error", audio: "" } };
+    return { type: "url", value: `error: ${err.message || "Unexpected music error"}` };
   }
 }
 
@@ -668,24 +672,24 @@ async function runVoiceRecast(job) {
   const jobId = job.id.toString();
 
   if (!audioUrl) {
-    return { type: "object", value: { jobId, status: "failed", audio: "" } };
+    return { type: "url", value: "error: Missing audioUrl" };
   }
 
   try {
     const sourceResponse = await fetch(audioUrl);
     if (!sourceResponse.ok) {
-      return { type: "object", value: { jobId, status: "failed", reason: "Failed to fetch source audio", audio: "" } };
+      return { type: "url", value: "error: Failed to fetch source audio" };
     }
 
     const audioBuffer = Buffer.from(await sourceResponse.arrayBuffer());
 
     if (audioBuffer.length > 25 * 1024 * 1024) {
-      return { type: "object", value: { jobId, status: "failed", reason: "Audio file too large (max 25MB)", audio: "" } };
+      return { type: "url", value: "error: Audio file too large (max 25MB)" };
     }
 
     const estimatedDurationSeconds = (audioBuffer.length / 128000) * 8;
     if (estimatedDurationSeconds > 295) {
-      return { type: "object", value: { jobId, status: "failed", reason: "Audio too long for voice recast (max ~5 minutes)", audio: "" } };
+      return { type: "url", value: "error: Audio too long for voice recast (max ~5 minutes)" };
     }
 
     const audioBlob = new Blob([audioBuffer], { type: "audio/mpeg" });
@@ -699,11 +703,11 @@ async function runVoiceRecast(job) {
     for await (const chunk of audioStream) chunks.push(chunk);
     const resultBuffer = Buffer.concat(chunks);
     const url = await uploadToS3(resultBuffer, `voicerecast/${job.id}.mp3`, "audio/mpeg");
-    return { type: "object", value: { jobId, status: "completed", audio: url } };
+    return { type: "url", value: url };
 
   } catch (err) {
     console.error("Voice recast error:", err?.message || err);
-    return { type: "object", value: { jobId, status: "failed", reason: err.message || "Unexpected voice recast error", audio: "" } };
+    return { type: "url", value: `error: ${err.message || "Unexpected voice recast error"}` };
   }
 }
 
@@ -722,20 +726,20 @@ async function dispatchJob(job) {
     else if (job.name === "musicproduction") payload = await runPremiumMusic(job);
     else if (job.name === "voiceover")       payload = await runVoiceover(job);
     else if (job.name === "voicerecast")     payload = await runVoiceRecast(job);
-    else payload = { type: "object", value: { jobId, status: "failed", reason: `Unknown job type: ${job.name}` } };
+    else payload = { type: "url", value: `error: Unknown job type: ${job.name}` };
   } catch (err) {
     console.error("dispatchJob error:", err);
-    payload = { type: "object", value: { jobId, status: "failed", reason: "Unhandled dispatch error" } };
+    payload = { type: "url", value: `error: Unhandled dispatch error` };
   }
 
   jobResultCache.set(jobId, { payload, delivered: false });
-  console.log("Result cached:", jobId, payload.value?.status, payload.value?.reason || "");
+  console.log("Result cached:", jobId, payload.value);
 
   const delay = AUTO_DELIVER_DELAY[job.name] || 35000;
   setTimeout(async () => {
     const cached = jobResultCache.get(jobId);
     if (cached && !cached.delivered) {
-      console.log(`Auto-delivering [${job.name}] (Phase 3 not received):`, jobId, cached.payload.value?.status);
+      console.log(`Auto-delivering [${job.name}] (Phase 3 not received):`, jobId, cached.payload.value);
       try {
         cached.delivered = true;
         await safeDeliver(job, cached.payload);
@@ -789,10 +793,7 @@ async function main() {
         id: job?.id,
         name: job?.name,
         phase: memoToSign?.nextPhase,
-        memoCount: job?.memos?.length,
-        provider: job?.providerAddress,
-        client: job?.clientAddress,
-        evaluator: job?.evaluatorAddress
+        memoCount: job?.memos?.length
       });
 
       if (!memoToSign) {
@@ -873,7 +874,7 @@ async function main() {
 
           if (cached && !cached.delivered) {
             cached.delivered = true;
-            console.log("Delivering from Phase 3:", jobId, cached.payload.value?.status);
+            console.log("Delivering from Phase 3:", jobId, cached.payload.value);
             await safeDeliver(job, cached.payload);
             console.log("Phase 3 delivery success:", jobId);
           } else if (cached && cached.delivered) {
@@ -881,8 +882,8 @@ async function main() {
           } else {
             console.log("No cached result after wait, delivering fallback:", jobId);
             await safeDeliver(job, {
-              type: "object",
-              value: { jobId, status: "failed", reason: "Processing did not complete in time" }
+              type: "url",
+              value: "error: Processing did not complete in time"
             });
           }
         } catch (err) {
@@ -909,7 +910,9 @@ async function main() {
       console.log("onEvaluate fired:", jobId, "result:", JSON.stringify(job.result));
 
       try {
-        const success = job.result?.status === "completed";
+        // For type:url payloads, success = value exists and doesn't start with "error:"
+        const resultValue = job.result?.value || "";
+        const success = typeof resultValue === "string" && resultValue.length > 0 && !resultValue.startsWith("error:");
         await safeEvaluate(job, success, success ? "Service completed successfully" : "Service failed");
         console.log(success ? "Escrow released:" : "Escrow refunded:", jobId);
       } catch (err) {
